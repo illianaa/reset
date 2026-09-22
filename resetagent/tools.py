@@ -8,7 +8,7 @@ from __future__ import annotations
 import contextlib
 from pathlib import Path
 
-from resetagent import config, db, ideas, runs, status
+from resetagent import config, db, ideas, models, runs, status, workspace
 from resetagent.providers.common import describe
 from resetagent.timeutil import local, now, parse_iso, span
 
@@ -64,13 +64,19 @@ def get_usage(conn, refresh: bool = False) -> dict:
 def list_ideas(conn, include_finished: bool = False) -> dict:
     rows = ideas.listing(conn, include_all=include_finished)
     return {"ideas": [{"number": r["id"], "title": r["title"], "text": r["text"][:400], "status": r["status"],
-                       "engine": r["engine"], "saved": local(r["created_at"])} for r in rows]}
+                       "engine": r["engine"], "project": r["project"], "saved": local(r["created_at"])}
+                      for r in rows]}
 
 
-def add_idea(conn, text: str, engine: str | None = None) -> dict:
-    idea_id = ideas.add(conn, text, source="assistant", engine=engine)
+def add_idea(conn, text: str, engine: str | None = None, project: str | None = None) -> dict:
+    idea_id = ideas.add(conn, text, source="assistant", engine=engine, project=project)
     return {"saved": True, "number": idea_id, "title": ideas.title_for(text),
             "note": "Saved only. It runs only if the user approves a run request."}
+
+
+def update_idea(conn, number: int, text: str | None = None, engine: str | None = None,
+                project: str | None = None) -> dict:
+    return {"updated": ideas.update(conn, int(number), text=text, engine=engine, project=project)}
 
 
 def remove_idea(conn, number: int) -> dict:
@@ -114,24 +120,49 @@ def get_run(conn, run: int) -> dict:
             notes[name] = (root / name).read_text(errors="replace")[:2000]
     at = now()
     started = r["started_at"] or r["created_at"]
-    return {"run": r["id"], "idea": {"number": idea["id"], "title": idea["title"], "text": idea["text"][:600]},
-            "engine": r["engine"], "status": r["status"], "outcome": r["outcome"], "stopReason": r["stop_reason"],
-            "started": local(started, at), "duration": span((r["ended_at"] or at) - started),
-            "tokensUsed": r["tokens_used"], "tokenBudget": r["budget_tokens"],
-            "agentLastMessage": (r["summary"] or "")[:3000] or None, "error": r["error"],
-            "folder": str(root).replace(str(Path.home()), "~", 1),
-            "files": _files(root) if root.is_dir() else [], "notes": notes}
+    report = {"run": r["id"], "idea": {"number": idea["id"], "title": idea["title"], "text": idea["text"][:600]},
+              "engine": r["engine"], "model": r["model"] or "default", "effort": r["effort"], "status": r["status"],
+              "outcome": r["outcome"], "stopReason": r["stop_reason"], "started": local(started, at),
+              "duration": span((r["ended_at"] or at) - started), "tokensUsed": r["tokens_used"],
+              "tokenBudget": r["budget_tokens"], "timesBlocked": r["blocked"],
+              "agentLastMessage": (r["summary"] or "")[:3000] or None, "error": r["error"],
+              "folder": workspace.short(root), "notes": notes}
+    if r["branch"]:  # an existing codebase: what's on the run's branch is its work
+        report.update(project=workspace.short(r["project"]), **workspace.branch_work(r))
+    else:
+        report["files"] = _files(root) if root.is_dir() else []
+    return report
 
 
-def propose_run(conn, idea: int, engine: str | None = None, budget_tokens: int | None = None,
-                minutes: int | None = None) -> dict:
+def run_options(conn) -> dict:
+    """What a run can be set to: engines with their models and efforts, defaults, and project folders."""
+    cfg = config.load()
+    engines = {}
+    for engine in runs.ENGINES:
+        catalog = models.catalog(cfg, engine)
+        engines[engine] = {"available": bool(catalog), "models": [
+            {"model": m["id"], "name": m["name"], "efforts": m["efforts"], "isDefault": m["default"],
+             "about": m.get("description")} for m in catalog or []]}
+    return {"engines": engines,
+            "defaults": {"engine": "the subscription whose unused capacity expires soonest",
+                         "model": "the user's default for that engine", "effort": cfg["runs"]["effort"],
+                         "project": "the idea's project if it has one, else a fresh scratch folder"},
+            "access": cfg["runs"]["access"], "projectsFolder": workspace.short(workspace.projects_root(cfg)),
+            "projects": workspace.projects(cfg)}
+
+
+def propose_run(conn, idea: int, engine: str | None = None, model: str | None = None, effort: str | None = None,
+                project: str | None = None, budget_tokens: int | None = None, minutes: int | None = None) -> dict:
     try:
-        ask = runs.propose(conn, config.load(), int(idea), engine=engine, budget_tokens=budget_tokens,
-                           max_minutes=minutes, via="assistant")
+        ask = runs.propose(conn, config.load(), int(idea), engine=engine, model=model, effort=effort,
+                           project=project, budget_tokens=budget_tokens, max_minutes=minutes, via="assistant")
     except runs.RunError as exc:
         return {"requested": False, "reason": str(exc)}
-    return {"requested": True, "code": ask["code"], "expires": local(ask["expires_at"]),
-            "note": "The user was sent the request with Start/Skip buttons. Only they can start it."}
+    return {"requested": True, "engine": ask["engine"], "model": ask["model"] or "default",
+            "effort": ask["effort"], "project": ask["project"] or "scratch folder", "code": ask["code"],
+            "expires": local(ask["expires_at"]),
+            "note": "The user was sent the request (with the reason for this engine) and Start/Skip buttons. "
+                    "Only they can start it."}
 
 
 def stop_runs(conn, run: int | None = None) -> dict:
@@ -146,6 +177,9 @@ def _schema(properties: dict, required=()) -> dict:
 
 
 ENGINE = {"type": "string", "enum": list(ideas.ENGINES)}
+PROJECT = {"type": "string", "description": "Where the work happens: a project folder name from run_options (an "
+                                            "existing codebase runs on a new branch in its own worktree), a new "
+                                            "folder name for a brand-new project, or empty for a scratch folder."}
 TOOLS = {
     "get_usage": (get_usage, "Usage limits, reset times, one-time resets and paid-usage status for each connected AI "
                   "subscription, with how fresh the data is.",
@@ -153,8 +187,13 @@ TOOLS = {
                                                                           "the last stored reading."}})),
     "list_ideas": (list_ideas, "The user's saved ideas, numbered.",
                    _schema({"include_finished": {"type": "boolean"}})),
-    "add_idea": (add_idea, "Save a new idea in the user's words. Saving never runs it.",
-                 _schema({"text": {"type": "string"}, "engine": ENGINE}, ["text"])),
+    "add_idea": (add_idea, "Save a new idea in the user's words. Saving never runs it. Set project when the idea "
+                 "belongs to an existing codebase or names its own new folder.",
+                 _schema({"text": {"type": "string"}, "engine": ENGINE, "project": PROJECT}, ["text"])),
+    "update_idea": (update_idea, "Change an idea's text, preferred engine or project. An empty string clears "
+                    "engine or project.",
+                    _schema({"number": {"type": "integer"}, "text": {"type": "string"}, "engine": {"type": "string"},
+                             "project": {"type": "string"}}, ["number"])),
     "remove_idea": (remove_idea, "Remove (archive) an idea by number.",
                     _schema({"number": {"type": "integer"}}, ["number"])),
     "list_runs": (list_runs, "Recent runs (newest first) and pending run requests.",
@@ -162,10 +201,20 @@ TOOLS = {
     "get_run": (get_run, "Everything about one run: outcome, the working agent's last message, its notes and the "
                 "files it made. Use this to summarize what a run got done.",
                 _schema({"run": {"type": "integer"}}, ["run"])),
+    "run_options": (run_options, "What a run can be set to: each engine's models and the effort levels each model "
+                    "supports, the defaults, whether runs have full access, and the user's project folders. Check it "
+                    "before choosing a model, effort or project.", _schema({})),
     "propose_run": (propose_run, "Ask the user to approve running an idea. They get Start/Skip buttons; you cannot "
-                    "start runs yourself.",
-                    _schema({"idea": {"type": "integer"}, "engine": ENGINE, "budget_tokens": {"type": "integer"},
-                             "minutes": {"type": "integer"}}, ["idea"])),
+                    "start runs yourself. Every setting is optional: leave engine out to let Reset pick the "
+                    "subscription whose unused capacity expires soonest; model defaults to the user's default for "
+                    "that engine; effort defaults to high (use xhigh or max for hard or long tasks, ultra only for "
+                    "big coding jobs on models that support it); project defaults to the idea's project, else a "
+                    "scratch folder.",
+                    _schema({"idea": {"type": "integer"}, "engine": ENGINE,
+                             "model": {"type": "string", "description": "A model id or name from run_options, "
+                                                                        "e.g. gpt-5.6-sol or fable."},
+                             "effort": {"type": "string", "enum": list(models.EFFORTS)}, "project": PROJECT,
+                             "budget_tokens": {"type": "integer"}, "minutes": {"type": "integer"}}, ["idea"])),
     "stop_runs": (stop_runs, "Stop running work right away (one run by number, or everything) and cancel pending "
                   "requests.", _schema({"run": {"type": "integer"}})),
 }

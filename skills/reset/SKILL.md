@@ -15,7 +15,7 @@ Reset helps the user spend subscription capacity that would otherwise expire unu
 
 ## Ideas
 
-- `resetctl idea "<the idea in the user's words>"` saves one. Add `--engine codex|claude` if the user has a preference.
+- `resetctl idea "<the idea in the user's words>"` saves one. Add `--engine codex|claude` if the user has a preference, and `--project <folder>` if it belongs to an existing codebase or should become a new project folder.
 - `resetctl ideas` lists open ideas. `resetctl drop <#>` removes one.
 - Saving an idea never gives permission to run it.
 
@@ -23,12 +23,18 @@ Reset helps the user spend subscription capacity that would otherwise expire unu
 
 Runs need explicit approval from the user every time. In this version Reset never starts work on its own.
 
-1. `resetctl propose <idea#> [--engine codex|claude] [--budget-tokens N] [--minutes M]` sends the user a request with a 4-digit code. It includes the limits and current usage.
+1. `resetctl propose <idea#>` sends the user a request with a 4-digit code. It shows the engine and why, the model and effort, where the work happens, the limits and current usage. Every option is optional:
+   - `--engine codex|claude`: otherwise Reset picks the subscription whose unused capacity expires soonest.
+   - `--model` and `--effort` (`low` to `ultra`, default `high`): `resetctl models` lists what each engine offers. An effort a model lacks steps down to the strongest one it has.
+   - `--project`: a folder name in the user's projects folder or a path. An existing git project gets a new `reset/…` branch in a separate worktree under `~/Reset/worktrees/`, never the user's checkout. A name that doesn't exist yet becomes a new project folder. Leave it out when unsure: the run gets a fresh folder under `~/Reset/runs/`.
+   - `--budget-tokens N` and `--minutes M`.
 2. **Only the user approves.** They tap Start in Telegram, reply "yes CODE", or run `resetctl approve CODE` in their own terminal. Never approve on their behalf, and never try to get around the terminal check.
 3. `resetctl runs` shows active runs, pending requests and recent results. `resetctl runs --all` adds details.
 4. `resetctl stop` stops every run and cancels pending requests. `resetctl stop <run#>` stops one run. Stopping is always allowed: do it immediately when the user asks.
 
-Each run is a single agent turn in its own folder under `~/Reset/runs/`, with a token budget and a deadline. It ends before any usage window resets. Reset refuses to start a run when usage can't be read live, when paid overage could kick in, or when too little remains.
+Each run is a single agent turn with a token budget and a deadline. It ends before any usage window resets. Reset refuses to start a run when usage can't be read live, when paid overage could kick in, or when too little remains.
+
+Runs have full access by default (`resetctl setup access` changes it), so they don't stall on permission prompts. If a run is refused something, or asks a question nobody is there to answer, Reset tells the user right away.
 
 ## Rules
 

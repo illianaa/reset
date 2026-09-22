@@ -112,6 +112,7 @@ class ControlSession:
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait()
+        self.process.stdout.close()
         shutil.rmtree(self.cwd, ignore_errors=True)
 
 
@@ -123,6 +124,19 @@ def read_live(executable: str) -> dict:
     finally:
         session.close()
     return normalize_usage(usage, now())
+
+
+def list_models(executable: str) -> list:
+    """Models Claude Code offers this account, with the effort levels each supports."""
+    session = ControlSession(executable)
+    try:
+        session.request("initialize")
+        data = session.request("list_models")
+    finally:
+        session.close()
+    return [{"id": m["value"], "name": m.get("displayName") or m["value"], "description": m.get("description"),
+             "efforts": m.get("supportedEffortLevels") or [], "default": m.get("value") == "default"}
+            for m in (data.get("models") or []) if m.get("value")]
 
 
 LIMIT_LABELS = {"session": "5-hour", "weekly_all": "Weekly (all models)"}

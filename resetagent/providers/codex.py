@@ -16,7 +16,7 @@ from resetagent.timeutil import iso, now
 
 # Redemption stays manual in this version: no Reset client may call it.
 FORBIDDEN = frozenset({"account/rateLimitResetCredit/consume"})
-READ_METHODS = frozenset({"initialize", "account/read", "account/rateLimits/read"})
+READ_METHODS = frozenset({"initialize", "account/read", "account/rateLimits/read", "model/list"})
 RUN_METHODS = READ_METHODS | frozenset({"thread/start", "turn/start", "turn/interrupt"})
 
 DESKTOP_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex"
@@ -198,6 +198,25 @@ def paid_usage(balances: dict) -> dict:
         spendable = bool(balance.get("unlimited")) or bool(balance.get("hasCredits"))
         possible = spendable if possible is None else (possible or spendable)
     return {"possible": possible}
+
+
+def list_models(executable: str) -> list:
+    """Models this account can use, with the effort levels each supports."""
+    client = ReadOnlyCodex(executable)
+    try:
+        initialize(client, "reset_models")
+        items, cursor = [], None
+        while True:
+            page = client.call("model/list", {"includeHidden": False, **({"cursor": cursor} if cursor else {})}) or {}
+            items += page.get("data") or []
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+    finally:
+        client.close()
+    return [{"id": m["id"], "name": m.get("displayName") or m["id"], "description": m.get("description"),
+             "efforts": [e.get("reasoningEffort") for e in m.get("supportedReasoningEfforts") or []],
+             "default": bool(m.get("isDefault"))} for m in items if m.get("id")]
 
 
 def read_status(executable: str) -> dict:

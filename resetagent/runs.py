@@ -9,14 +9,13 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import re
 import secrets
 import signal
 import subprocess
 import sys
 import time
 
-from resetagent import config, db, ideas, notify, proctree, status
+from resetagent import config, db, ideas, models, notify, proctree, status, workspace
 from resetagent.providers.common import describe
 from resetagent.timeutil import iso, local, now, span
 
@@ -112,14 +111,22 @@ def usage_line(data: dict, at: float) -> str:
 
 def propose(conn, cfg: dict, idea_id: int, engine: str | None = None, budget_tokens: int | None = None,
             max_minutes: int | None = None, effort: str | None = None, via: str = "cli",
-            at: float | None = None):
+            at: float | None = None, model: str | None = None, project: str | None = None):
+    """Ask the user to approve a run. engine/model/effort/project are optional; each falls back sensibly."""
     at = now() if at is None else at
     idea = ideas.get(conn, idea_id)
     if idea is None or idea["status"] != "open":
         raise RunError(f"Idea #{idea_id} isn't an open idea.")
-    engine = (engine or idea["engine"] or "codex").lower()
-    if engine not in engines_allowed():
-        raise RunError(f"Engine must be one of: {', '.join(ENGINES)}.")
+    if effort and effort.lower() not in models.EFFORTS:
+        raise RunError(f"Effort must be one of: {', '.join(models.EFFORTS)}.")
+    if model and not engine:
+        engine = models.engine_for(model, cfg)
+        if engine is None:
+            raise RunError(f"I don't know which engine runs “{model}”. Say “codex” or “claude” too.")
+    try:
+        target = workspace.resolve(cfg, project if project is not None else idea["project"])
+    except workspace.WorkspaceError as exc:
+        raise RunError(str(exc)) from None
     busy = active_run(conn)
     if busy:
         raise RunError(f"Run #{busy['id']} is still going. Send “stop” first.")
@@ -128,29 +135,113 @@ def propose(conn, cfg: dict, idea_id: int, engine: str | None = None, budget_tok
     minutes = int(max_minutes or limits["maxMinutes"])
     if budget <= 0 or minutes <= 0:
         raise RunError("Budget and time limit must be positive.")
-    data = snapshot_for(cfg, engine)
-    earliest = check_capacity(cfg, engine, data)
-    if lease_deadline(cfg, at, minutes, earliest) - at < 5 * 60:
-        raise RunError(f"A {engine_name(engine)} limit resets at {local(earliest, at)}, too soon to run safely.")
-    effort = effort or (limits["codexEffort"] if engine == "codex" else None)
+    skipped = []
+    for candidate, reason in engine_choices(conn, cfg, idea, requested=engine, at=at):
+        if candidate not in engines_allowed():
+            raise RunError(f"Engine must be one of: {', '.join(ENGINES)}.")
+        data = snapshot_for(cfg, candidate)
+        try:
+            earliest = check_capacity(cfg, candidate, data)
+            if lease_deadline(cfg, at, minutes, earliest) - at < 5 * 60:
+                raise RunError(f"A {engine_name(candidate)} limit resets at {local(earliest, at)}, "
+                               "too soon to run safely.")
+            if candidate in ENGINES:
+                picked = models.choose(cfg, candidate, model, effort)
+            else:
+                picked = {"model": model, "effort": effort or limits["effort"], "label": "test model", "note": None}
+        except models.ModelError as exc:
+            if engine:
+                raise RunError(str(exc)) from None
+            skipped.append((candidate, str(exc)))
+            continue
+        except RunError as exc:
+            skipped.append((candidate, str(exc)))
+            continue
+        engine = candidate
+        if skipped:  # the first choice couldn't take a run right now
+            reason = f"{engine_name(skipped[0][0])} can't take a run right now ({skipped[0][1].rstrip('.')})"
+        break
+    else:
+        raise RunError(" ".join(dict.fromkeys(message for _, message in skipped)))
     code = new_code(conn)
     nonce = secrets.token_hex(4)  # binds a button tap to this exact request
     expires = at + limits["askMinutes"] * 60
     snapshot = json.dumps({"observedAt": data.get("observedAt"), "windows": data.get("windows")})
     ask_id = conn.execute(
         "INSERT INTO asks(code, idea_id, engine, budget_tokens, max_minutes, effort, snapshot, created_at, "
-        "expires_at, nonce) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (code, idea_id, engine, budget, minutes, effort, snapshot, at, expires, nonce)).lastrowid
+        "expires_at, nonce, model, project) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (code, idea_id, engine, budget, minutes, picked["effort"], snapshot, at, expires, nonce, picked["model"],
+         str(target["path"]) if target["path"] else None)).lastrowid
+    other = next((e for e in ENGINES if e != engine), None) if engine in ENGINES else None
     text = (f"Run idea #{idea_id} with {engine_name(engine)}? “{idea['title']}”\n"
-            f"Limits: up to {budget / 1000:g}k tokens and {minutes} min, in its own folder; "
+            + (f"Why {engine_name(engine)}: {reason}.\n" if reason else "")
+            + f"Model: {picked['label']}" + (f" · effort {picked['effort']}" if picked["effort"] else "")
+            + f" · {cfg['runs']['access']} access" + (f" ({picked['note']})" if picked["note"] else "") + "\n"
+            + f"Where: {target['label']}\n"
+            + f"Limits: up to {budget / 1000:g}k tokens and {minutes} min; "
             f"it stops early before any limit resets.\n"
             f"{engine_name(engine)} now: {usage_line(data, at)}.\n"
-            f"To start, tap Start or reply “yes {code}”; to skip, reply “no {code}”. Expires {local(expires, at)}.")
-    buttons = [[{"text": "▶️ Start", "data": f"ask:{ask_id}:{nonce}:y"},
-                {"text": "Skip", "data": f"ask:{ask_id}:{nonce}:n"}]]
+            f"To start, tap Start or reply “yes {code}”; to skip, reply “no {code}”"
+            + (f"; for {engine_name(other)}, reply “run {idea_id} on {other}”" if other else "")
+            + f". Expires {local(expires, at)}.")
+    buttons = [[{"text": f"▶️ Start on {engine_name(engine)}", "data": f"ask:{ask_id}:{nonce}:y"}],
+               ([{"text": f"Use {engine_name(other)} instead", "data": f"ask:{ask_id}:{nonce}:x"}] if other else [])
+               + [{"text": "Skip", "data": f"ask:{ask_id}:{nonce}:n"}]]
     notify.enqueue(conn, "ask", text, dedupe_key=f"ask:{ask_id}",
                    channel=via if via in CHANNEL_NAMES else None, expires_at=expires, buttons=buttons)
     return conn.execute("SELECT * FROM asks WHERE id = ?", (ask_id,)).fetchone()
+
+
+def at_risk(data: dict, at: float):
+    """How urgently a subscription's unused weekly capacity will expire: (score, reset time, unused %) or None."""
+    weekly = [w for w in status.weekly(data) if w.get("resetsAt") and w["resetsAt"] > at
+              and w.get("remainingPercent") is not None]
+    if data.get("state") != "live" or not weekly:
+        return None
+    soonest = min(w["resetsAt"] for w in weekly)
+    unused = max(w["remainingPercent"] for w in weekly if w["resetsAt"] - soonest < 120)
+    return unused / max((soonest - at) / 3600, 0.5), soonest, unused
+
+
+def engine_choices(conn, cfg: dict, idea, requested: str | None = None, at: float | None = None) -> list:
+    """Engines to try, in order, each with the reason it was picked.
+
+    An engine the user asked for wins, then the idea's own preference. Otherwise the subscription whose
+    unused capacity expires soonest goes first, so the run spends usage that would otherwise be lost.
+    """
+    at = now() if at is None else at
+    if requested:
+        return [(requested.lower(), None)]
+    if idea["engine"]:
+        return [(idea["engine"], f"idea #{idea['id']} is set to use {engine_name(idea['engine'])}")]
+    providers = (status.latest(conn) or {}).get("providers") or {}
+    ranked = []
+    for engine in ENGINES:
+        risk = at_risk(providers.get(engine) or {}, at)
+        if risk:
+            score, reset, unused = risk
+            ranked.append((score, engine, f"its week resets {local(reset, at)} with {unused:g}% unused"))
+    ranked.sort(reverse=True)
+    choices = [(engine, reason) for _, engine, reason in ranked]
+    return choices + [(engine, None) for engine in ENGINES if engine not in {c[0] for c in choices}]
+
+
+def switch(conn, cfg: dict, code: str, via: str):
+    """Replace a pending request with the same idea on the other engine."""
+    ask = conn.execute("SELECT * FROM asks WHERE code = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+                       (code,)).fetchone()
+    if ask is None:
+        raise RunError(f"No pending request with code {code}.")
+    other = next((e for e in ENGINES if e != ask["engine"]), None)
+    if ask["engine"] not in ENGINES or other is None:
+        raise RunError("There's no other engine to switch to.")
+    # Create the new request first: if it can't be made, the original stays pending.
+    replacement = propose(conn, cfg, ask["idea_id"], engine=other, budget_tokens=ask["budget_tokens"],
+                          max_minutes=ask["max_minutes"], effort=ask["effort"], via=via,
+                          project=ask["project"] or "")
+    conn.execute("UPDATE asks SET status = 'declined', decided_at = ?, decided_via = ? WHERE id = ?",
+                 (now(), f"switched to {other}", ask["id"]))
+    return replacement
 
 
 def decline(conn, code: str, via: str) -> bool:
@@ -202,7 +293,11 @@ def approve(conn, cfg: dict, code: str, via: str, at: float | None = None):
     if deadline - at < 5 * 60:
         _fail_ask(conn, ask["id"])
         raise RunError(f"A limit resets at {local(earliest, at)}, too soon to run safely.")
-    workdir = make_workdir(cfg, idea)
+    try:
+        prepared = workspace.prepare(cfg, idea, workspace.resolve(cfg, ask["project"] or ""))
+    except workspace.WorkspaceError as exc:
+        _fail_ask(conn, ask["id"])
+        raise RunError(str(exc)) from None
     with db.transaction(conn):
         if conn.execute(f"SELECT 1 FROM runs WHERE status IN {ACTIVE_SQL}").fetchone():
             raise RunError("Another run is already going. Send “stop” first.")
@@ -212,27 +307,14 @@ def approve(conn, cfg: dict, code: str, via: str, at: float | None = None):
             raise RunError("That request was already answered.")
         run_id = conn.execute(
             "INSERT INTO runs(ask_id, idea_id, engine, workdir, budget_tokens, deadline_at, effort, status, "
-            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'starting', ?)",
-            (ask["id"], idea["id"], ask["engine"], str(workdir), ask["budget_tokens"], deadline,
-             ask["effort"], at)).lastrowid
+            "created_at, model, project, workspace, branch) VALUES (?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?)",
+            (ask["id"], idea["id"], ask["engine"], str(prepared["workdir"]), ask["budget_tokens"], deadline,
+             ask["effort"], at, ask["model"], str(prepared["project"]) if prepared["project"] else None,
+             prepared["kind"], prepared["branch"])).lastrowid
         conn.execute("UPDATE asks SET run_id = ? WHERE id = ?", (run_id, ask["id"]))
         ideas.set_status(conn, idea["id"], "running")
     launch(conn, run_id)
     return get(conn, run_id)
-
-
-def make_workdir(cfg: dict, idea) -> Path:
-    slug = re.sub(r"[^a-z0-9]+", "-", idea["title"].lower()).strip("-")[:40] or "idea"
-    root = config.runs_root(cfg)
-    root.mkdir(parents=True, exist_ok=True)
-    path = root / f"{time.strftime('%Y%m%d-%H%M%S')}-idea{idea['id']}-{slug}"
-    path.mkdir()
-    (path / "IDEA.md").write_text(f"# Idea #{idea['id']}\n\n{idea['text']}\n")
-    try:
-        subprocess.run(["git", "init", "-q"], cwd=path, capture_output=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return path
 
 
 def launch(conn, run_id: int) -> None:

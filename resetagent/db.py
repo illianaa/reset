@@ -155,6 +155,14 @@ CREATE TABLE IF NOT EXISTS brain_tasks (
 ADDED_COLUMNS = [
     ("notifications", "buttons", "TEXT"),
     ("asks", "nonce", "TEXT"),
+    ("ideas", "project", "TEXT"),
+    ("asks", "model", "TEXT"),
+    ("asks", "project", "TEXT"),
+    ("runs", "model", "TEXT"),
+    ("runs", "project", "TEXT"),
+    ("runs", "workspace", "TEXT"),
+    ("runs", "branch", "TEXT"),
+    ("runs", "blocked", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 

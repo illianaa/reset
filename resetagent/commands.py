@@ -15,7 +15,8 @@ HELP = ("Reset commands:\n"
         "idea <text> · save an idea (or start with +)\n"
         "ideas · list them · drop <#> · remove one\n"
         "status · usage and resets\n"
-        "run <#> [codex|claude] · I'll ask before starting it\n"
+        "run <#> · I'll ask before starting it, on the subscription that expires soonest\n"
+        "run <#> on codex with sol at xhigh · pick the engine, model or effort\n"
         "yes <code> / no <code> · answer a request\n"
         "runs · what's running · stop · stop everything")
 
@@ -25,6 +26,7 @@ class Command:
     kind: str
     arg: str | None = None
     extra: str | None = None
+    options: dict | None = None
 
 
 PATTERNS = [
@@ -35,8 +37,8 @@ PATTERNS = [
     (re.compile(r"^(?:yes|y|approve|go|start)\s+(\d{4})\.?$", re.I), "approve"),
     (re.compile(r"^(?:yes|y|approve|go|start)[.!]?$", re.I), "approve-missing-code"),
     (re.compile(r"^(?:no|n|skip|decline)\s+(\d{4})\.?$", re.I), "decline"),
+    (re.compile(r"^(?:switch|swap)\s+(\d{4})$", re.I), "switch"),
     (re.compile(r"^stop(?:\s+(?:run\s+)?#?(\d+|all))?[.!]?$", re.I), "stop"),
-    (re.compile(r"^(?:run|propose)\s+#?(\d+)(?:\s+(?:on\s+|with\s+|in\s+)?(codex|claude))?$", re.I), "propose"),
     (re.compile(r"^(?:runs|jobs)\??$", re.I), "runs"),
     (re.compile(r"^(?:drop|remove|delete)\s+(?:idea\s+)?#?(\d+)$", re.I), "drop"),
     (re.compile(r"^(?:ok|buzzed|got it)\s+(\d{4})$", re.I), "delivery-buzz"),
@@ -46,6 +48,12 @@ PATTERNS = [
 
 
 SLASH = re.compile(r"/([A-Za-z_]+)(?:@\w+)?(?:\s+(.*))?", re.S)
+# "run 3", "run 3 on codex", "run #3 with sol at xhigh", "run 3 on claude with fable at max effort"
+RUN = re.compile(r"(?:run|propose)\s+#?(\d+)"
+                 r"(?:\s+(?:(?:on|in|with|using)\s+)?(codex|claude))?"
+                 r"(?:\s+(?:with|using)\s+(?!(?:low|medium|high|xhigh|extra|max|ultra)\b)([\w.\[\]-]+))?"
+                 r"(?:\s+(?:(?:at|with)\s+)?(low|medium|high|xhigh|extra[\s-]?high|max|ultra)(?:\s+effort)?)?[.!]?",
+                 re.I)
 
 
 def parse(text: str) -> Command:
@@ -56,6 +64,11 @@ def parse(text: str) -> Command:
             return Command("help")
         body = f"{slash.group(1)} {slash.group(2) or ''}".strip()
     body = re.sub(r"^@?reset\b[\s,:]*", "", body, flags=re.I) or "help"
+    run = RUN.fullmatch(body)
+    if run:
+        idea, engine, model, effort = run.groups()
+        effort = effort and ("xhigh" if effort.lower().startswith("extra") else effort.lower())
+        return Command("propose", idea, engine and engine.lower(), {"model": model, "effort": effort})
     for pattern, kind in PATTERNS:
         match = pattern.match(body)
         if match:
@@ -105,7 +118,7 @@ def handle(conn, cfg: dict, row, command: Command) -> str | None:
         return status.render_short(snap) + f"\n(checked {span(age)} ago)"
     if kind == "propose":
         try:
-            runs.propose(conn, cfg, int(command.arg), engine=command.extra, via=channel)
+            runs.propose(conn, cfg, int(command.arg), engine=command.extra, via=channel, **(command.options or {}))
         except runs.RunError as exc:
             return str(exc)
         return None  # the request itself is sent as the reply
@@ -118,6 +131,12 @@ def handle(conn, cfg: dict, row, command: Command) -> str | None:
                 f"{local(run['deadline_at'])} or at {run['budget_tokens'] // 1000}k tokens. Send “stop” to stop it now.")
     if kind == "approve-missing-code":
         return "Include the 4-digit code from the request, like “yes 1234”, so I start the right thing."
+    if kind == "switch":
+        try:
+            runs.switch(conn, cfg, command.arg, via=channel)
+        except runs.RunError as exc:
+            return str(exc)
+        return None  # the new request is the reply
     if kind == "decline":
         return "Skipped." if runs.decline(conn, command.arg, via=channel) else f"No pending request with code {command.arg}."
     if kind == "stop":
