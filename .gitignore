@@ -1,0 +1,38 @@
+# Only what's needed to run Reset is committed.
+# Personal state lives outside the repo in ~/.reset (database, settings, bot token, logs).
+
+# Local-only: private notes, research, account snapshots, and the developer test suite
+.local/
+docs/
+scripts/
+tests/
+
+# Secrets and local environment (see .env.example)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Reset data, if RESET_HOME ever points inside the repo
+.reset/
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors, OS, and local agent settings
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.claude/settings.local.json
