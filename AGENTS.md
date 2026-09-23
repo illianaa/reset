@@ -24,6 +24,7 @@ Ground rules:
 1. **Check prerequisites:** `./bin/resetctl setup check`
    - Needs Python 3.9+ on macOS or Linux, and at least one of Codex (signed in with ChatGPT) or Claude Code (signed in with a Claude plan).
    - If neither is signed in, ask the user to sign in themselves: `codex login`, or run `claude` and then `/login`.
+   - The "Projects" line is the folder Reset found for the user's code (`~/Projects`, `~/code`, `~/Developer`…). Runs can also use any other folder in their home folder by path.
 
 2. **Link the command and skill:** `./bin/resetctl setup skill`
    - This puts `resetctl` in `~/.local/bin` and links the Reset skill into Claude Code and Codex.
@@ -39,11 +40,17 @@ Ground rules:
    - `auto` uses the signed-in Claude Code, then Codex. `--use none` means commands only.
    - Show that it works: `resetctl ask "how many one-time resets do I have?"`
 
-5. **Start the background service:** `resetctl setup service`
+5. **Give runs full access (recommended):** `resetctl setup access --access full`
+   - Tell the user what this means: approved runs can run commands, install packages and use the network without stopping to ask. Codex runs get no sandbox, and Claude Code runs use bypass-permissions mode.
+   - Every run still needs their OK, has a token budget and a deadline, and can be stopped at once. Work on an existing codebase happens on a new branch in its own git worktree, never in their checkout.
+   - If they prefer, use `--access sandboxed`: runs can change files in their own folder, and anything else (the network, installs, git commits) is refused. Runs never wait for an answer either way; Reset texts the user when a run is refused something.
+   - If Claude runs fail because bypass-permissions mode is turned off (some organizations disable it), switch to sandboxed.
+
+6. **Start the background service:** `resetctl setup service`
    - This installs a LaunchAgent on macOS or a systemd user service on Linux.
    - On Linux, mention `loginctl enable-linger $USER` if they want it running while logged out.
 
-6. **Send a test message:** `resetctl setup test`
+7. **Send a test message:** `resetctl setup test`
    - The user should get a Telegram message.
    - Suggest they reply `/status`, or ask "which ideas do you have?".
 
@@ -56,7 +63,8 @@ The Reset skill (`skills/reset/SKILL.md`) explains the day-to-day commands. The 
 - `resetctl status`
 - `resetctl idea "…"`
 - `resetctl ideas`
-- `resetctl propose <idea#>`
+- `resetctl propose <idea#> [--engine] [--model] [--effort] [--project]`
+- `resetctl models`
 - `resetctl runs`
 - `resetctl stop`
 - `resetctl ask "…"`
@@ -72,7 +80,8 @@ Python 3.9+, standard library only (no dependencies), macOS and Linux.
 | `resetagent/commands.py` | Handles exact commands (`/stop`, approvals, `/idea`…) without any model; free text goes to the brain |
 | `resetagent/brain.py` | Optional AI brain: Claude Code / Codex CLIs with Reset's tools, fallback order, provider-neutral conversation |
 | `resetagent/tools.py`, `mcp.py` | The brain's tools, served over MCP (stdio) |
-| `resetagent/runs.py`, `worker.py`, `proctree.py` | Run requests, one supervised worker per run, enforced and verified cancellation |
+| `resetagent/runs.py`, `worker.py`, `proctree.py` | Run requests (engine routing), one supervised worker per run, enforced and verified cancellation |
+| `resetagent/models.py`, `workspace.py` | Live model and effort lists per engine; where a run works (scratch folder, new project, git worktree) and the brief the agent gets |
 | `resetagent/providers/` | Reading usage: Codex app-server; Claude Code `get_usage`; Claude Desktop's cached reset grants |
 | `resetagent/monitor.py`, `notify.py`, `channels/` | Notification rules, durable outbox, Telegram (plus local and iMessage) delivery |
 | `resetagent/status.py`, `ideas.py`, `db.py`, `config.py` | Usage snapshots, the idea list, SQLite state in `~/.reset/`, settings |

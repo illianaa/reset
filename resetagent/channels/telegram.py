@@ -19,7 +19,8 @@ LIMIT = 4000  # Telegram allows 4096 characters per message
 COMMANDS = [("status", "Usage limits and one-time resets"), ("ideas", "Your idea list"),
             ("idea", "Save an idea: /idea <text>"), ("runs", "Active and recent runs"),
             ("stop", "Stop everything now"), ("help", "What I can do")]
-CALLBACK = re.compile(r"ask:(\d+):([0-9a-f]{8}):([yn])")
+CALLBACK = re.compile(r"ask:(\d+):([0-9a-f]{8}):([ynx])")
+TAPS = {"y": ("yes", "Starting…"), "n": ("no", "Skipped."), "x": ("switch", "Switching…")}
 
 
 def plain(text: str) -> str:
@@ -138,10 +139,9 @@ class Telegram:
             ask = match and conn.execute("SELECT code, status FROM asks WHERE id = ? AND nonce = ?",
                                          (int(match.group(1)), match.group(2))).fetchone()
             if ask and ask["status"] == "pending":
-                verb = "yes" if match.group(3) == "y" else "no"
+                verb, reply = TAPS[match.group(3)]
                 saved = int(persist_inbound(conn, self.name, f"cb:{query['id']}", str(query["from"]["id"]),
                                             f"{verb} {ask['code']}", now()))
-                reply = "Starting…" if verb == "yes" else "Skipped."
                 try:  # one tap per request
                     self.call("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message.get("message_id"),
                                                          "reply_markup": {"inline_keyboard": []}})

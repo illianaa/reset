@@ -13,7 +13,8 @@ def title_for(text: str) -> str:
     return first if len(first) <= 60 else first[:57].rstrip() + "…"
 
 
-def add(conn, text: str, source: str, source_ref: str | None = None, engine: str | None = None) -> int:
+def add(conn, text: str, source: str, source_ref: str | None = None, engine: str | None = None,
+        project: str | None = None) -> int:
     text = text.strip()
     if not text:
         raise ValueError("An idea needs some text.")
@@ -22,8 +23,9 @@ def add(conn, text: str, source: str, source_ref: str | None = None, engine: str
     stamp = now()
     try:
         cursor = conn.execute(
-            "INSERT INTO ideas(text, title, engine, source, source_ref, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)", (text, title_for(text), engine, source, source_ref, stamp, stamp))
+            "INSERT INTO ideas(text, title, engine, source, source_ref, created_at, updated_at, project) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (text, title_for(text), engine, source, source_ref, stamp, stamp,
+                                                project or None))
     except sqlite3.IntegrityError:
         # The same inbound message was already saved (e.g. after a restart mid-handling).
         row = conn.execute("SELECT id FROM ideas WHERE source_ref = ?", (source_ref,)).fetchone()
@@ -45,6 +47,21 @@ def listing(conn, include_all: bool = False) -> list:
 
 def set_status(conn, idea_id: int, status: str) -> None:
     conn.execute("UPDATE ideas SET status = ?, updated_at = ? WHERE id = ?", (status, now(), idea_id))
+
+
+def update(conn, idea_id: int, text: str | None = None, engine: str | None = None,
+           project: str | None = None) -> bool:
+    """Change an idea. An empty string clears engine or project."""
+    row = get(conn, idea_id)
+    if row is None:
+        return False
+    if engine and engine not in ENGINES:
+        raise ValueError(f"Engine must be one of: {', '.join(ENGINES)}")
+    text = text.strip() if text and text.strip() else row["text"]
+    conn.execute("UPDATE ideas SET text = ?, title = ?, engine = ?, project = ?, updated_at = ? WHERE id = ?",
+                 (text, title_for(text), row["engine"] if engine is None else (engine or None),
+                  row["project"] if project is None else (project or None), now(), idea_id))
+    return True
 
 
 def drop(conn, idea_id: int) -> bool:

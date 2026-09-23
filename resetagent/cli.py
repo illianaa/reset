@@ -10,7 +10,7 @@ import shutil
 import sys
 import time
 
-from resetagent import __version__, brain, channels, config, db, ideas, monitor, notify, runs, status
+from resetagent import __version__, brain, channels, config, db, ideas, models, monitor, notify, runs, status, workspace
 from resetagent.channels.base import ChannelError, ChannelUnavailable
 from resetagent.channels.imessage import IMessage
 from resetagent.channels.telegram import Telegram
@@ -65,7 +65,7 @@ def cmd_monitor(args) -> int:
 def cmd_idea(args) -> int:
     conn = db.connect()
     try:
-        idea_id = ideas.add(conn, " ".join(args.text), source=args.source, engine=args.engine)
+        idea_id = ideas.add(conn, " ".join(args.text), source=args.source, engine=args.engine, project=args.project)
     except ValueError as exc:
         return fail(str(exc))
     print(f"Saved idea #{idea_id}: {ideas.title_for(' '.join(args.text))}")
@@ -82,7 +82,8 @@ def cmd_ideas(args) -> int:
     for r in rows:
         extra = f" [{r['status']}]" if r["status"] != "open" else ""
         engine = f" ({r['engine']})" if r["engine"] else ""
-        print(f"#{r['id']:<4} {r['title']}{engine}{extra}")
+        project = f" → {r['project']}" if r["project"] else ""
+        print(f"#{r['id']:<4} {r['title']}{engine}{project}{extra}")
     return 0
 
 
@@ -99,8 +100,9 @@ def cmd_propose(args) -> int:
     conn = db.connect()
     cfg = config.load()
     try:
-        ask = runs.propose(conn, cfg, args.idea, engine=args.engine, budget_tokens=args.budget_tokens,
-                           max_minutes=args.minutes, effort=args.effort, via=args.via)
+        ask = runs.propose(conn, cfg, args.idea, engine=args.engine, model=args.model, effort=args.effort,
+                           project=args.project, budget_tokens=args.budget_tokens, max_minutes=args.minutes,
+                           via=args.via)
     except runs.RunError as exc:
         return fail(str(exc))
     delivered = notify.flush(conn, cfg)
@@ -411,6 +413,11 @@ def setup_check(args=None) -> int:
                f"paired with @{telegram.get('botUsername')}" if telegram.get("chatId") else
                "not set up: the user runs `resetctl setup telegram` in their own terminal")
     check_line("AI brain", brain.enabled(cfg), ", ".join(cfg["brain"]["order"]))
+    check_line("Run access", True, f"{cfg['runs']['access']} (change with `resetctl setup access`)")
+    root = workspace.projects_root(cfg)
+    found = len(workspace.projects(cfg, limit=10000)) if root.is_dir() else 0
+    check_line("Projects", root.is_dir(), f"{workspace.short(root)} ({found} folders)" if root.is_dir() else
+               f"{workspace.short(root)} doesn't exist yet; new projects will be created there")
     skill = Path.home() / ".claude/skills/reset"
     check_line("Skill", skill.is_symlink(), "linked" if skill.is_symlink() else "not linked: `resetctl setup skill`")
     service = daemon.service_status()
@@ -496,6 +503,26 @@ def setup_brain(args) -> int:
     return 0
 
 
+ACCESS_HELP = ("How much should runs be allowed to do on their own?\n"
+               "  1) Full access (recommended): runs can run commands, install packages and use the network without\n"
+               "     stopping to ask. Each run still needs your OK, has a budget and deadline, and existing codebases\n"
+               "     get their own branch in a separate worktree.\n"
+               "  2) Sandboxed: runs only edit files in their own folder; anything more is refused, and Reset tells\n"
+               "     you when that happens.")
+
+
+def setup_access(args) -> int:
+    choice = getattr(args, "access", None)
+    if choice is None and sys.stdin.isatty():
+        print(ACCESS_HELP)
+        choice = {"1": "full", "2": "sandboxed", "": "full"}.get(input("Choose [1]: ").strip(), "full")
+    choice = choice or "full"
+    with config.editing() as cfg:
+        cfg["runs"]["access"] = choice
+    print(f"Runs have {choice} access.")
+    return 0
+
+
 def setup_service(args=None) -> int:
     from resetagent import daemon
 
@@ -523,13 +550,13 @@ def setup_test(args=None) -> int:
 
 
 def cmd_setup(args) -> int:
-    steps = {"check": setup_check, "telegram": setup_telegram, "brain": setup_brain,
+    steps = {"check": setup_check, "telegram": setup_telegram, "brain": setup_brain, "access": setup_access,
              "skill": cmd_install_skill, "service": setup_service, "test": setup_test}
     if args.step:
         return steps[args.step](args)
     if not sys.stdin.isatty():
         return fail("Run `resetctl setup` in your own terminal, or run its steps one at a time (see AGENTS.md).")
-    for name in ("check", "telegram", "brain", "skill", "service", "test"):
+    for name in ("check", "telegram", "brain", "access", "skill", "service", "test"):
         print(f"\n== {name} ==")
         if steps[name](args):
             return fail(f"Setup stopped at the {name} step; fix the issue above and run `resetctl setup` again.")
@@ -548,6 +575,18 @@ def cmd_ask(args) -> int:
     if reply is None:
         return fail(brain.fallback(who))
     print(f"{reply}\n\n(answered by {who})")
+    return 0
+
+
+def cmd_models(args) -> int:
+    cfg = config.load()
+    for engine in runs.ENGINES:
+        catalog = models.catalog(cfg, engine)
+        print(f"{engine.capitalize()}:" + ("" if catalog else " unavailable (is it installed and signed in?)"))
+        for m in catalog or []:
+            efforts = ", ".join(m["efforts"]) or "no effort levels"
+            print(f"  {m['id']:<24} {m['name']:<24} {efforts}" + ("  (default)" if m["default"] else ""))
+    print(f"\nDefault effort: {cfg['runs']['effort']} · run access: {cfg['runs']['access']}")
     return 0
 
 
@@ -572,6 +611,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("idea", help="save an idea (saving never runs it)")
     p.add_argument("text", nargs="+")
     p.add_argument("--engine", choices=ideas.ENGINES)
+    p.add_argument("--project", help="project folder name or path the idea belongs to")
     p.add_argument("--source", default="cli", help=argparse.SUPPRESS)
     p.set_defaults(fn=cmd_idea)
 
@@ -587,9 +627,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("propose", help="ask the user to approve a bounded run of an idea")
     p.add_argument("idea", type=int)
     p.add_argument("--engine", choices=runs.engines_allowed())
+    p.add_argument("--model", help="model id or name (see `resetctl models`)")
+    p.add_argument("--effort", choices=models.EFFORTS)
+    p.add_argument("--project", help="project folder name or path; empty for a scratch folder")
     p.add_argument("--budget-tokens", type=int)
     p.add_argument("--minutes", type=int)
-    p.add_argument("--effort")
     p.add_argument("--via", default="cli", help=argparse.SUPPRESS)
     p.set_defaults(fn=cmd_propose)
 
@@ -655,7 +697,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_install_skill)
 
     p = sub.add_parser("setup", help="guided setup; run a single step to script it (see AGENTS.md)")
-    p.add_argument("step", nargs="?", choices=["check", "telegram", "brain", "skill", "service", "test"])
+    p.add_argument("step", nargs="?", choices=["check", "telegram", "brain", "access", "skill", "service", "test"])
+    p.add_argument("--access", choices=["full", "sandboxed"], help="how much runs may do (with the access step)")
     p.add_argument("--token", help="Telegram bot token (prefer the hidden prompt)")
     p.add_argument("--use", help="brain order: auto, none, or a comma list of claude-code,codex")
     p.add_argument("--claude-model")
@@ -667,6 +710,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("question", nargs="+")
     p.add_argument("--brain", choices=list(brain.BACKENDS))
     p.set_defaults(fn=cmd_ask)
+
+    p = sub.add_parser("models", help="models and effort levels each engine offers")
+    p.set_defaults(fn=cmd_models)
 
     p = sub.add_parser("mcp")  # internal: Reset's tools over MCP for AI brains
     p.set_defaults(fn=cmd_mcp)

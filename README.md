@@ -7,7 +7,10 @@ Claude and ChatGPT plans give you usage limits that reset every week, and someti
 - **See what's left:** weekly and 5-hour limits, and one-time resets with their expiry dates, for Codex (ChatGPT plans) and Claude Code.
 - **Get a heads-up:** a message when a week is about to reset mostly unused, and 7 days before a one-time reset expires.
 - **Keep an idea list:** text `/idea build a tiny CLI that…` whenever inspiration strikes.
-- **Put ideas to work:** Reset asks before every run and runs each approved idea as a bounded background job (token budget, time limit, its own folder). `/stop` kills it for real.
+- **Put ideas to work:** Reset asks before every run, then runs the idea as a bounded background job (token budget, time limit). `/stop` kills it for real.
+  - It picks the subscription whose unused capacity expires soonest, unless you name one.
+  - You can choose the model and effort ("run 3 on codex with sol at xhigh").
+  - Work on an existing project happens on its own branch in a separate git worktree. New ideas get their own folder.
 - **Ask it anything:** "how many one-time resets do I have?", "what did run 3 get done?" Replies come from an AI brain running on your own Claude Code or Codex.
 
 Reset never sees your AI passwords or tokens. It works through the official `codex` and `claude` tools you're already signed in to.
@@ -60,6 +63,8 @@ The commands never depend on AI, so they keep working even when every usage limi
 
 - **Nothing runs without your OK.** Every run needs your tap or code, and approvals can't come from an AI.
 - **Bounded runs.** Each run has a token budget and a deadline, ends before any usage window resets, and refuses to start if paid overage could kick in.
+- **Full access by default, so runs don't stall.** Runs can run commands and install packages without stopping to ask. If a run is still blocked, or asks a question nobody is there to answer, Reset texts you. Prefer tighter limits? `resetctl setup access --access sandboxed`.
+- **Your checkout stays untouched.** Runs on an existing codebase work on a new `reset/…` branch in a separate worktree, for you to review.
 - **Real cancellation.** Stopping kills every process the run started and verifies that nothing survived.
 - **Redemption stays with you.** Reset tells you how to redeem one-time resets; it doesn't redeem them itself.
 - **Your data stays local.** Everything lives in `~/.reset/`.

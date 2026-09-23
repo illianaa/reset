@@ -117,15 +117,19 @@ DEFAULTS = {
         "unavailableNoticeHours": 6,
     },
     "runs": {
-        "root": "~/Reset/runs",
+        "root": "~/Reset/runs",           # scratch folders for runs without a project
+        "projectsRoot": None,             # where projects live and new ones go; None finds ~/Projects, ~/code…
+        # full: runs may run any command, install packages and use the network, so they never stall on
+        # a permission prompt. sandboxed: file edits inside the run's own folder only.
+        "access": "full",
+        "effort": "high",
         "budgetTokens": 150000,
         "maxMinutes": 20,
         "askMinutes": 30,
         "stopGraceSeconds": 10,
         "resetMarginMinutes": 30,
         "minRemainingPercent": 10,
-        "codexEffort": "medium",
-        "claudeMaxBudgetUsd": 2.0,
+        "claudeMaxBudgetUsd": 10.0,  # a backstop; the token budget is the real limit
     },
     "daemon": {"inboxSeconds": 3},
 }
@@ -154,6 +158,10 @@ def load(apply_env: bool = True) -> dict:
         stored = json.loads(path().read_text())
     except FileNotFoundError:
         stored = {}
+    runs = stored.get("runs") or {}
+    runs.pop("codexEffort", None)  # replaced by runs.effort
+    if runs.get("claudeMaxBudgetUsd") == 2.0:  # an old default that was saved as if chosen
+        runs.pop("claudeMaxBudgetUsd")
     cfg = merged(DEFAULTS, stored)
     if apply_env:
         for keys, name in ENV_OVERRIDES:
@@ -166,6 +174,21 @@ def load(apply_env: bool = True) -> dict:
     return cfg
 
 
+_SAME = object()
+
+
+def changes(value, default):
+    """Only what differs from the defaults, so improved defaults reach existing users."""
+    if isinstance(value, dict) and isinstance(default, dict):
+        out = {}
+        for key, item in value.items():
+            kept = changes(item, default[key]) if key in default else item
+            if kept is not _SAME:
+                out[key] = kept
+        return out or _SAME
+    return _SAME if value == default else value
+
+
 def save(cfg: dict) -> None:
     target = path()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -173,7 +196,8 @@ def save(cfg: dict) -> None:
     # The file can hold a Telegram bot token, so keep it private.
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as handle:
-        json.dump(cfg, handle, indent=2)
+        kept = changes(cfg, DEFAULTS)
+        json.dump({} if kept is _SAME else kept, handle, indent=2)
         handle.write("\n")
     os.replace(temp, target)
 
