@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 
-from resetagent import config, db, ideas, models, notify, proctree, status, workspace
+from resetagent import apps, config, db, ideas, models, notify, proctree, status, workspace
 from resetagent.providers.common import describe
 from resetagent.timeutil import iso, local, now, span
 
@@ -45,6 +45,11 @@ def get(conn, run_id: int):
 
 def active_run(conn):
     return conn.execute(f"SELECT * FROM runs WHERE status IN {ACTIVE_SQL} ORDER BY id LIMIT 1").fetchone()
+
+
+def held_open(run) -> bool:
+    """The run's work is done, but its live chat is still open in the Claude app (worker.hold)."""
+    return run is not None and run["status"] in ACTIVE and run["outcome"] == "completed"
 
 
 def snapshot_for(cfg: dict, engine: str) -> dict:
@@ -128,7 +133,7 @@ def propose(conn, cfg: dict, idea_id: int, engine: str | None = None, budget_tok
     except workspace.WorkspaceError as exc:
         raise RunError(str(exc)) from None
     busy = active_run(conn)
-    if busy:
+    if busy and not held_open(busy):  # a finished run whose chat is still open closes when the next one starts
         raise RunError(f"Run #{busy['id']} is still going. Send “stop” first.")
     limits = cfg["runs"]
     budget = int(budget_tokens or limits["budgetTokens"])
@@ -293,6 +298,9 @@ def approve(conn, cfg: dict, code: str, via: str, at: float | None = None):
     if deadline - at < 5 * 60:
         _fail_ask(conn, ask["id"])
         raise RunError(f"A limit resets at {local(earliest, at)}, too soon to run safely.")
+    busy = active_run(conn)
+    if held_open(busy):  # its work is done; close its chat (it moves to Claude Desktop) so this run can start
+        enforce_stop(conn, cfg, busy, "another run started")
     try:
         prepared = workspace.prepare(cfg, idea, workspace.resolve(cfg, ask["project"] or ""))
     except workspace.WorkspaceError as exc:
@@ -481,6 +489,11 @@ def summary_text(conn, at: float | None = None) -> str:
     lines = []
     for run in conn.execute(f"SELECT * FROM runs WHERE status IN {ACTIVE_SQL} ORDER BY id").fetchall():
         started = run["started_at"] or run["created_at"]
+        if held_open(run):
+            lines.append(f"Run #{run['id']} ({engine_name(run['engine'])}, idea #{run['idea_id']}) is done · its chat "
+                         "stays open in the Claude app until you leave it"
+                         + (", then moves to Claude Desktop" if apps.desktop() else ""))
+            continue
         lines.append(f"Run #{run['id']} ({engine_name(run['engine'])}, idea #{run['idea_id']}) {run['status']} · "
                      f"{span(at - started)} · {run['tokens_used'] / 1000:.1f}k of {run['budget_tokens'] / 1000:g}k "
                      f"tokens · stops by {local(run['deadline_at'], at)}")

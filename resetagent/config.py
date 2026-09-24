@@ -32,6 +32,7 @@ ENV_VARS = {
     "RESET_IMESSAGE_DB": "Path to a Messages database (tests).",
     "RESET_ALLOW_FAKE_ENGINE": "Set to 1 to enable the fake run engine (tests only).",
     "RESET_FAKE_SNAPSHOT": "Usage snapshot JSON used by the fake engine (tests only).",
+    "RESET_FAKE_PRESENCE": "File saying where the user is (claude, elsewhere or away) instead of asking macOS (tests only).",
 }
 
 # Settings an environment variable can override: (path in config.json, variable).
@@ -122,6 +123,9 @@ DEFAULTS = {
         # full: runs may run any command, install packages and use the network, so they never stall on
         # a permission prompt. sandboxed: file edits inside the run's own folder only.
         "access": "full",
+        # Show runs as chats in the desktop apps: Codex runs are named and pinned; Claude runs switch on
+        # Remote Control, so they can be watched live in the Claude app and on the phone.
+        "showInApps": True,
         "effort": "high",
         "budgetTokens": 150000,
         "maxMinutes": 20,

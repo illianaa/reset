@@ -11,6 +11,10 @@ Claude and ChatGPT plans give you usage limits that reset every week, and someti
   - It picks the subscription whose unused capacity expires soonest, unless you name one.
   - You can choose the model and effort ("run 3 on codex with sol at xhigh").
   - Work on an existing project happens on its own branch in a separate git worktree. New ideas get their own folder.
+  - Runs show up as chats in your apps, and you can pick them up days later like chats you started yourself.
+    - Codex runs are pinned in the Codex app.
+    - You can watch Claude runs live in the Claude app, on your Mac or your phone. When one finishes, its chat stays open while you're in the Claude app. Once you leave the app, it moves into Claude Desktop's Code tab.
+    - **Open in Codex** or **Open in Claude** takes you straight to a run's chat on your Mac.
 - **Ask it anything:** "how many one-time resets do I have?", "what did run 3 get done?" Replies come from an AI brain running on your own Claude Code or Codex.
 
 Reset never sees your AI passwords or tokens. It works through the official `codex` and `claude` tools you're already signed in to.
@@ -73,6 +77,8 @@ The commands never depend on AI, so they keep working even when every usage limi
 ## Configuration
 
 You don't need to configure anything by hand: `resetctl setup` saves your settings in `~/.reset/config.json`, which only your user account can read. That includes your Telegram bot token.
+
+Runs appear in the Codex and Claude apps by default. Claude runs use Claude Code's Remote Control for this, so while one is running, anyone signed in to your Claude account can also message it. To keep runs out of the apps, set `"runs": {"showInApps": false}` in that file.
 
 To override a setting with an environment variable (for example the bot token, or the path to `codex`), copy [.env.example](.env.example) to `.env` and uncomment what you need. Git ignores `.env`, and the background service reads it too.
 

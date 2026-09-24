@@ -151,7 +151,8 @@ CREATE TABLE IF NOT EXISTS brain_tasks (
 );
 """
 
-# Columns added after the first release; connect() adds any that an older database lacks.
+# Columns added after the first release; connect() adds any that an older database lacks, then runs the
+# statement that fills it in for the rows already there, if one is given.
 ADDED_COLUMNS = [
     ("notifications", "buttons", "TEXT"),
     ("asks", "nonce", "TEXT"),
@@ -163,6 +164,10 @@ ADDED_COLUMNS = [
     ("runs", "workspace", "TEXT"),
     ("runs", "branch", "TEXT"),
     ("runs", "blocked", "INTEGER NOT NULL DEFAULT 0"),
+    ("runs", "live_url", "TEXT"),
+    # Claude runs: handed to Claude Desktop ("done") or why not. Runs from before stay out of the apps.
+    ("runs", "handoff", "TEXT", "UPDATE runs SET handoff = 'not-shown'"),
+    ("runs", "handed_off_at", "REAL"),
 ]
 
 
@@ -175,10 +180,12 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=15000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
-    for table, column, kind in ADDED_COLUMNS:
+    for table, column, kind, *fill in ADDED_COLUMNS:
         present = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in present:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+            for statement in fill:
+                conn.execute(statement)
     try:
         os.chmod(target, 0o600)
     except OSError:

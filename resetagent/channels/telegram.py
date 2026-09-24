@@ -20,6 +20,7 @@ COMMANDS = [("status", "Usage limits and one-time resets"), ("ideas", "Your idea
             ("idea", "Save an idea: /idea <text>"), ("runs", "Active and recent runs"),
             ("stop", "Stop everything now"), ("help", "What I can do")]
 CALLBACK = re.compile(r"ask:(\d+):([0-9a-f]{8}):([ynx])")
+OPEN = re.compile(r"run:(\d+):open")  # "Open in Codex/Claude" under a finished run
 TAPS = {"y": ("yes", "Starting…"), "n": ("no", "Skipped."), "x": ("switch", "Switching…")}
 
 
@@ -133,7 +134,12 @@ class Telegram:
         message = query.get("message") or {}
         chat_id = (message.get("chat") or {}).get("id")
         saved, reply = 0, "Only the paired account can do that."
-        if self.owner(chat_id, (query.get("from") or {}).get("id")):
+        opening = OPEN.fullmatch(query.get("data") or "")
+        if opening and self.owner(chat_id, (query.get("from") or {}).get("id")):
+            saved = int(persist_inbound(conn, self.name, f"cb:{query['id']}", str(query["from"]["id"]),
+                                        f"open {opening.group(1)}", now()))
+            reply = "Opening it on your Mac…"
+        elif self.owner(chat_id, (query.get("from") or {}).get("id")):
             reply = "That request is no longer valid."
             match = CALLBACK.fullmatch(query.get("data") or "")
             ask = match and conn.execute("SELECT code, status FROM asks WHERE id = ? AND nonce = ?",

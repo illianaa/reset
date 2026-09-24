@@ -17,7 +17,8 @@ from resetagent.timeutil import iso, now
 # Redemption stays manual in this version: no Reset client may call it.
 FORBIDDEN = frozenset({"account/rateLimitResetCredit/consume"})
 READ_METHODS = frozenset({"initialize", "account/read", "account/rateLimits/read", "model/list"})
-RUN_METHODS = READ_METHODS | frozenset({"thread/start", "turn/start", "turn/interrupt"})
+RUN_METHODS = READ_METHODS | frozenset({"thread/start", "turn/start", "turn/interrupt",
+                                         "thread/name/set", "threadSection/list", "thread/section/move"})
 
 DESKTOP_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex"
 

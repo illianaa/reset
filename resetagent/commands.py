@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-from resetagent import brain, db, ideas, notify, runs, status
+from resetagent import apps, brain, db, ideas, notify, runs, status
 from resetagent.providers.common import describe
 from resetagent.timeutil import local, now, span
 
@@ -18,7 +18,8 @@ HELP = ("Reset commands:\n"
         "run <#> · I'll ask before starting it, on the subscription that expires soonest\n"
         "run <#> on codex with sol at xhigh · pick the engine, model or effort\n"
         "yes <code> / no <code> · answer a request\n"
-        "runs · what's running · stop · stop everything")
+        "runs · what's running · stop · stop everything\n"
+        "open <run#> · open a run's chat in the Codex or Claude app on your Mac")
 
 
 @dataclass
@@ -40,6 +41,7 @@ PATTERNS = [
     (re.compile(r"^(?:switch|swap)\s+(\d{4})$", re.I), "switch"),
     (re.compile(r"^stop(?:\s+(?:run\s+)?#?(\d+|all))?[.!]?$", re.I), "stop"),
     (re.compile(r"^(?:runs|jobs)\??$", re.I), "runs"),
+    (re.compile(r"^(?:open|show)\s+(?:run\s+)?#?(\d+)(?:\s+in\s+(?:the\s+)?(?:codex|claude|app))?[.!]?$", re.I), "open"),
     (re.compile(r"^(?:drop|remove|delete)\s+(?:idea\s+)?#?(\d+)$", re.I), "drop"),
     (re.compile(r"^(?:ok|buzzed|got it)\s+(\d{4})$", re.I), "delivery-buzz"),
     (re.compile(r"^(?:quiet|silent)\s+(\d{4})$", re.I), "delivery-silent"),
@@ -127,8 +129,14 @@ def handle(conn, cfg: dict, row, command: Command) -> str | None:
             run = runs.approve(conn, cfg, command.arg, via=channel)
         except runs.RunError as exc:
             return str(exc)
+        where = ""
+        if cfg["runs"]["showInApps"] and run["engine"] == "codex":
+            where = " It's pinned in the Codex app."
+        elif cfg["runs"]["showInApps"] and run["engine"] == "claude":
+            where = " I'll send a link to watch it live in the Claude app."
         return (f"Started run #{run['id']} on {run['engine'].capitalize()}. It stops by "
-                f"{local(run['deadline_at'])} or at {run['budget_tokens'] // 1000}k tokens. Send “stop” to stop it now.")
+                f"{local(run['deadline_at'])} or at {run['budget_tokens'] // 1000}k tokens.{where} "
+                "Send “stop” to stop it now.")
     if kind == "approve-missing-code":
         return "Include the 4-digit code from the request, like “yes 1234”, so I start the right thing."
     if kind == "switch":
@@ -147,6 +155,9 @@ def handle(conn, cfg: dict, row, command: Command) -> str | None:
         return runs.describe_stop(results)
     if kind == "runs":
         return runs.summary_text(conn)
+    if kind == "open":
+        run = runs.get(conn, int(command.arg))
+        return apps.open_run(conn, run) if run else f"No run #{command.arg}."
     if kind == "drop":
         return f"Removed idea #{command.arg}." if ideas.drop(conn, int(command.arg)) else \
             f"Couldn't remove idea #{command.arg} (missing or running)."

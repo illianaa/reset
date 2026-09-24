@@ -10,7 +10,8 @@ import shutil
 import sys
 import time
 
-from resetagent import __version__, brain, channels, config, db, ideas, models, monitor, notify, runs, status, workspace
+from resetagent import (__version__, apps, brain, channels, config, db, ideas, models, monitor, notify, runs, status,
+                        workspace)
 from resetagent.channels.base import ChannelError, ChannelUnavailable
 from resetagent.channels.imessage import IMessage
 from resetagent.channels.telegram import Telegram
@@ -147,6 +148,15 @@ def cmd_stop(args) -> int:
     target = None if args.run in (None, "all") else int(args.run)
     results = runs.stop(conn, config.load(), run_id=target, reason="stop from terminal")
     print(runs.describe_stop(results) if results["runs"] or results["declined"] else "Nothing is running.")
+    return 0
+
+
+def cmd_open(args) -> int:
+    conn = db.connect()
+    run = runs.get(conn, args.run)
+    if run is None:
+        return fail(f"No run #{args.run}.")
+    print(apps.open_run(conn, run))
     return 0
 
 
@@ -651,6 +661,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="include recent finished runs")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_runs)
+
+    p = sub.add_parser("open", help="open a run's chat in the Codex or Claude desktop app")
+    p.add_argument("run", type=int)
+    p.set_defaults(fn=cmd_open)
 
     p = sub.add_parser("grant", help="manually record a one-time reset Reset can't see")
     p.add_argument("action", choices=["list", "add", "remove"], nargs="?", default="list")
