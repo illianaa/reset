@@ -1,14 +1,15 @@
 """Reset's tools for AI brains. One implementation, reached over MCP by Claude Code and Codex.
 
 Brains can read everything and take a few safe actions (save/remove ideas, request a run, stop).
-They cannot approve runs, redeem resets or change settings: those stay with the user.
+They can change only the settings listed in settings.py, and Reset announces each change with an Undo button.
+They cannot approve runs or redeem resets: those stay with the user.
 """
 from __future__ import annotations
 
 import contextlib
 from pathlib import Path
 
-from resetagent import apps, config, db, ideas, models, runs, status, workspace
+from resetagent import apps, config, db, ideas, models, runs, settings, status, workspace
 from resetagent.providers.common import describe
 from resetagent.timeutil import local, now, parse_iso, span
 
@@ -151,7 +152,9 @@ def run_options(conn) -> dict:
             "defaults": {"engine": "the subscription whose unused capacity expires soonest",
                          "model": "the user's default for that engine", "effort": cfg["runs"]["effort"],
                          "project": "the idea's project if it has one, else a fresh scratch folder"},
-            "access": cfg["runs"]["access"], "projectsFolder": workspace.short(workspace.projects_root(cfg)),
+            "access": cfg["runs"]["access"], "keepPercent": cfg["runs"]["keepPercent"],
+            "runsAtOncePerSubscription": cfg["runs"]["maxRunsPerEngine"],
+            "projectsFolder": workspace.short(workspace.projects_root(cfg)),
             "projects": workspace.projects(cfg)}
 
 
@@ -174,10 +177,25 @@ def open_run(conn, run: int) -> dict:
     return {"result": apps.open_run(conn, r) if r else f"No run #{run}."}
 
 
+def get_settings(conn) -> dict:
+    return {"settings": settings.listing(config.load()),
+            "note": "change_setting changes one. Reset tells the user about each change, with an Undo button."}
+
+
+def change_setting(conn, setting: str, value: str) -> dict:
+    try:
+        old, new = settings.change(conn, setting, value, by_ai=True)
+    except settings.SettingError as exc:
+        return {"changed": False, "reason": str(exc)}
+    return {"changed": old != new, "setting": setting, "from": settings.show(setting, old),
+            "to": settings.show(setting, new),
+            "note": "Reset sent the user its own message about this change, with an Undo button."}
+
+
 def stop_runs(conn, run: int | None = None) -> dict:
     results = runs.stop(conn, config.load(), run_id=None if run is None else int(run), reason="stop via assistant")
     if not results["runs"] and not results["declined"]:
-        return {"stopped": [], "message": "Nothing was running."}
+        return {"stopped": [], "message": "Nothing was running." if run is None else f"Run #{run} wasn't running."}
     return {"stopped": [r["run"] for r in results["runs"]], "message": runs.describe_stop(results)}
 
 
@@ -227,8 +245,17 @@ TOOLS = {
     "open_run": (open_run, "Open a run's chat in its desktop app (Codex or Claude) on the user's Mac, so they can "
                  "read it or continue it there. A Claude run can only move to Claude Desktop once it's done.",
                  _schema({"run": {"type": "integer"}}, ["run"])),
-    "stop_runs": (stop_runs, "Stop running work right away (one run by number, or everything) and cancel pending "
-                  "requests.", _schema({"run": {"type": "integer"}})),
+    "get_settings": (get_settings, "Reset's settings the user can tune by chatting: each one's current value, what it "
+                     "does and what it accepts.", _schema({})),
+    "change_setting": (change_setting, "Change one of Reset's settings (see get_settings), only because the user "
+                       "asked for it in this conversation. Reset also tells the user about the change, with an "
+                       "Undo button.",
+                       _schema({"setting": {"type": "string", "enum": list(settings.SETTINGS)},
+                                "value": {"type": "string", "description": "The new value, e.g. \"3\" for 3%, "
+                                                                           "\"on\", \"sandboxed\" or \"7, 1\"."}},
+                               ["setting", "value"])),
+    "stop_runs": (stop_runs, "Stop running work right away: one run by number, or everything (which also cancels "
+                  "pending requests).", _schema({"run": {"type": "integer"}})),
 }
 NAMES = tuple(TOOLS)
 

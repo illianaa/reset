@@ -32,6 +32,7 @@ class Daemon:
         self.stopping = False
         self.last_status = 0.0
         self.last_sweep = 0.0
+        self.last_guard = 0.0
         self.channel_problems: dict = {}
 
     def step(self, label: str, fn, *args):
@@ -94,6 +95,11 @@ class Daemon:
             self.step("commands", commands.process_pending, conn, cfg)
             self.step("asks", runs.expire_asks, conn)
             self.step("supervise", runs.supervise, conn, cfg)
+            if time.time() - self.last_guard >= 300:  # runs working side by side: keep each subscription's floor
+                self.last_guard = time.time()
+                stopped = self.step("guard", runs.guard, conn, cfg)
+                if stopped:
+                    log(f"over the usage floor or paid usage on: stopped runs {stopped}")
             if time.time() - self.last_sweep >= 5:  # finished Claude runs move to Claude Desktop
                 self.last_sweep = time.time()
                 handed = self.step("apps", apps.sweep, conn, cfg)

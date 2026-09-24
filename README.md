@@ -8,6 +8,7 @@ Claude and ChatGPT plans give you usage limits that reset every week, and someti
 - **Get a heads-up:** a message when a week is about to reset mostly unused, and 7 days before a one-time reset expires.
 - **Keep an idea list:** text `/idea build a tiny CLI that…` whenever inspiration strikes.
 - **Put ideas to work:** Reset asks before every run, then runs the idea as a bounded background job (token budget, time limit). `/stop` kills it for real.
+  - Several runs can go at once: by default up to 3 on each subscription (`runs.maxRunsPerEngine`). When one subscription is full, a new run goes to the other.
   - It picks the subscription whose unused capacity expires soonest, unless you name one.
   - You can choose the model and effort ("run 3 on codex with sol at xhigh").
   - Work on an existing project happens on its own branch in a separate git worktree. New ideas get their own folder.
@@ -16,6 +17,7 @@ Claude and ChatGPT plans give you usage limits that reset every week, and someti
     - You can watch Claude runs live in the Claude app, on your Mac or your phone. When one finishes, its chat stays open while you're in the Claude app. Once you leave the app, it moves into Claude Desktop's Code tab.
     - **Open in Codex** or **Open in Claude** takes you straight to a run's chat on your Mac.
 - **Ask it anything:** "how many one-time resets do I have?", "what did run 3 get done?" Replies come from an AI brain running on your own Claude Code or Codex.
+- **Tune it by chatting:** "lower my floor to 3%", "allow 5 runs at once", "make runs sandboxed", "remind me 7 days and 1 day before a reset expires". Reset confirms every change in its own message, with an Undo button.
 
 Reset never sees your AI passwords or tokens. It works through the official `codex` and `claude` tools you're already signed in to.
 
@@ -58,7 +60,8 @@ There's nothing else to install.
 | `/ideas` | Lists your ideas |
 | `run 3` | Reset asks you to approve running idea 3, with Start/Skip buttons |
 | `/runs` | What's running, and recent results |
-| `/stop` | Stops everything immediately and cancels pending requests |
+| `/stop` | Stops everything immediately and cancels pending requests (`stop 3` stops only run 3) |
+| `/floor 8` | Runs leave at least 8% of every usage limit untouched (`/floor` shows the current share) |
 | anything else | Answered by the AI brain |
 
 The commands never depend on AI, so they keep working even when every usage limit is exhausted. If the Claude brain is out of usage, the Codex brain answers, and the other way round.
@@ -67,6 +70,7 @@ The commands never depend on AI, so they keep working even when every usage limi
 
 - **Nothing runs without your OK.** Every run needs your tap or code, and approvals can't come from an AI.
 - **Bounded runs.** Each run has a token budget and a deadline, ends before any usage window resets, and refuses to start if paid overage could kick in.
+- **Your share stays yours.** Runs only start while you have at least 5% left of every limit. While runs are going, Reset rechecks every 5 minutes. If a subscription dips below that share, or paid usage turns on, Reset stops that subscription's runs. To keep a different share, ask your bot, or send `floor 10` with the percentage you want.
 - **Full access by default, so runs don't stall.** Runs can run commands and install packages without stopping to ask. If a run is still blocked, or asks a question nobody is there to answer, Reset texts you. Prefer tighter limits? `resetctl setup access --access sandboxed`.
 - **Your checkout stays untouched.** Runs on an existing codebase work on a new `reset/…` branch in a separate worktree, for you to review.
 - **Real cancellation.** Stopping kills every process the run started and verifies that nothing survived.

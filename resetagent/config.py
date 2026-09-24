@@ -127,12 +127,13 @@ DEFAULTS = {
         # Remote Control, so they can be watched live in the Claude app and on the phone.
         "showInApps": True,
         "effort": "high",
+        "maxRunsPerEngine": 3,  # runs working at once on each subscription (Codex, Claude)
         "budgetTokens": 150000,
         "maxMinutes": 20,
         "askMinutes": 30,
         "stopGraceSeconds": 10,
         "resetMarginMinutes": 30,
-        "minRemainingPercent": 10,
+        "keepPercent": 5,  # runs leave at least this share of every usage limit untouched (the "floor")
         "claudeMaxBudgetUsd": 10.0,  # a backstop; the token budget is the real limit
     },
     "daemon": {"inboxSeconds": 3},
@@ -164,6 +165,10 @@ def load(apply_env: bool = True) -> dict:
         stored = {}
     runs = stored.get("runs") or {}
     runs.pop("codexEffort", None)  # replaced by runs.effort
+    # Renamed runs.keepPercent. Early versions saved its old default (10) as if chosen; keep only real choices.
+    old = runs.pop("minRemainingPercent", None)
+    if old not in (None, 10):
+        runs.setdefault("keepPercent", old)
     if runs.get("claudeMaxBudgetUsd") == 2.0:  # an old default that was saved as if chosen
         runs.pop("claudeMaxBudgetUsd")
     cfg = merged(DEFAULTS, stored)

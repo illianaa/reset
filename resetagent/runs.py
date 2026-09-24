@@ -43,13 +43,38 @@ def get(conn, run_id: int):
     return conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
 
 
-def active_run(conn):
-    return conn.execute(f"SELECT * FROM runs WHERE status IN {ACTIVE_SQL} ORDER BY id LIMIT 1").fetchone()
-
-
 def held_open(run) -> bool:
     """The run's work is done, but its live chat is still open in the Claude app (worker.hold)."""
     return run is not None and run["status"] in ACTIVE and run["outcome"] == "completed"
+
+
+def working(conn, engine: str | None = None) -> list:
+    """Runs still doing their work, oldest first (a finished run whose chat is only held open doesn't count)."""
+    rows = conn.execute(f"SELECT * FROM runs WHERE status IN {ACTIVE_SQL} ORDER BY id").fetchall()
+    return [r for r in rows if not held_open(r) and (engine is None or r["engine"] == engine)]
+
+
+def check_room(conn, cfg: dict, engine: str) -> None:
+    """Refuse when this subscription already has as many runs going as it's allowed at once."""
+    going = working(conn, engine)
+    if len(going) >= cfg["runs"]["maxRunsPerEngine"]:
+        numbers = ", ".join(f"#{r['id']}" for r in going)
+        raise RunError(f"{engine_name(engine)} already has {len(going)} run{'s' if len(going) != 1 else ''} going "
+                       f"({numbers}), as many as it's allowed at once. Stop one to make room, or raise "
+                       "runs.maxRunsPerEngine in ~/.reset/config.json.")
+
+
+def check_place(conn, target: dict) -> None:
+    """Two runs never change the same folder in place, or one inside the other (runs on a git project each get
+    their own worktree)."""
+    if target["kind"] not in ("folder", "new") or not target["path"]:
+        return
+    path = Path(target["path"]).resolve()
+    for run in conn.execute(f"SELECT id, workdir FROM runs WHERE status IN {ACTIVE_SQL} ORDER BY id").fetchall():
+        other = Path(run["workdir"]).resolve()
+        if other == path or other in path.parents or path in other.parents:
+            raise RunError(f"Run #{run['id']} is already working in {workspace.short(other)}. Pick another folder, "
+                           "or wait until it's done.")
 
 
 def snapshot_for(cfg: dict, engine: str) -> dict:
@@ -83,11 +108,11 @@ def check_capacity(cfg: dict, engine: str, data: dict) -> float | None:
     unknown = [w for w in windows if w.get("remainingPercent") is None]
     if unknown:
         raise RunError(f"{name} usage for {unknown[0].get('label') or unknown[0]['id']} is unknown. Not starting.")
-    floor = cfg["runs"]["minRemainingPercent"]
+    floor = cfg["runs"]["keepPercent"]
     for w in windows:
         if w["remainingPercent"] < floor:
-            raise RunError(f"{name} {w.get('label') or w['id']} has only {w['remainingPercent']:g}% left "
-                           f"(minimum {floor}%). Not starting.")
+            raise RunError(f"{name} {w.get('label') or w['id']} has only {w['remainingPercent']:g}% left, and you "
+                           f"keep at least {floor}%. Not starting.")
     resets = [w["resetsAt"] for w in windows if w.get("resetsAt")]
     return min(resets) if resets else None
 
@@ -132,9 +157,7 @@ def propose(conn, cfg: dict, idea_id: int, engine: str | None = None, budget_tok
         target = workspace.resolve(cfg, project if project is not None else idea["project"])
     except workspace.WorkspaceError as exc:
         raise RunError(str(exc)) from None
-    busy = active_run(conn)
-    if busy and not held_open(busy):  # a finished run whose chat is still open closes when the next one starts
-        raise RunError(f"Run #{busy['id']} is still going. Send “stop” first.")
+    check_place(conn, target)
     limits = cfg["runs"]
     budget = int(budget_tokens or limits["budgetTokens"])
     minutes = int(max_minutes or limits["maxMinutes"])
@@ -144,6 +167,11 @@ def propose(conn, cfg: dict, idea_id: int, engine: str | None = None, budget_tok
     for candidate, reason in engine_choices(conn, cfg, idea, requested=engine, at=at):
         if candidate not in engines_allowed():
             raise RunError(f"Engine must be one of: {', '.join(ENGINES)}.")
+        try:
+            check_room(conn, cfg, candidate)  # a full subscription hands the run to the other one
+        except RunError as exc:
+            skipped.append((candidate, str(exc)))
+            continue
         data = snapshot_for(cfg, candidate)
         try:
             earliest = check_capacity(cfg, candidate, data)
@@ -280,6 +308,12 @@ def approve(conn, cfg: dict, code: str, via: str, at: float | None = None):
     if idea is None or idea["status"] != "open":
         _fail_ask(conn, ask["id"])
         raise RunError(f"Idea #{ask['idea_id']} is no longer open.")
+    # When there's no room, or its folder is busy, the request stays pending: it can be approved again later.
+    still_open = f" Request {code} stays open until {local(ask['expires_at'], at)}: send “yes {code}” to try again."
+    try:
+        check_room(conn, cfg, ask["engine"])
+    except RunError as exc:
+        raise RunError(f"{exc}{still_open}") from None
     data = snapshot_for(cfg, ask["engine"])
     try:
         earliest = check_capacity(cfg, ask["engine"], data)
@@ -298,29 +332,43 @@ def approve(conn, cfg: dict, code: str, via: str, at: float | None = None):
     if deadline - at < 5 * 60:
         _fail_ask(conn, ask["id"])
         raise RunError(f"A limit resets at {local(earliest, at)}, too soon to run safely.")
-    busy = active_run(conn)
-    if held_open(busy):  # its work is done; close its chat (it moves to Claude Desktop) so this run can start
-        enforce_stop(conn, cfg, busy, "another run started")
     try:
-        prepared = workspace.prepare(cfg, idea, workspace.resolve(cfg, ask["project"] or ""))
+        target = workspace.resolve(cfg, ask["project"] or "")
     except workspace.WorkspaceError as exc:
         _fail_ask(conn, ask["id"])
         raise RunError(str(exc)) from None
-    with db.transaction(conn):
-        if conn.execute(f"SELECT 1 FROM runs WHERE status IN {ACTIVE_SQL}").fetchone():
-            raise RunError("Another run is already going. Send “stop” first.")
-        claimed = conn.execute("UPDATE asks SET status = 'approved', decided_at = ?, decided_via = ? "
-                               "WHERE id = ? AND status = 'pending'", (at, via, ask["id"]))
-        if claimed.rowcount != 1:
-            raise RunError("That request was already answered.")
-        run_id = conn.execute(
-            "INSERT INTO runs(ask_id, idea_id, engine, workdir, budget_tokens, deadline_at, effort, status, "
-            "created_at, model, project, workspace, branch) VALUES (?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?)",
-            (ask["id"], idea["id"], ask["engine"], str(prepared["workdir"]), ask["budget_tokens"], deadline,
-             ask["effort"], at, ask["model"], str(prepared["project"]) if prepared["project"] else None,
-             prepared["kind"], prepared["branch"])).lastrowid
-        conn.execute("UPDATE asks SET run_id = ? WHERE id = ?", (run_id, ask["id"]))
-        ideas.set_status(conn, idea["id"], "running")
+    try:
+        check_place(conn, target)
+    except RunError as exc:
+        raise RunError(f"{exc}{still_open}") from None
+    try:
+        prepared = workspace.prepare(cfg, idea, target)
+    except workspace.WorkspaceError as exc:
+        _fail_ask(conn, ask["id"])
+        raise RunError(str(exc)) from None
+    try:
+        with db.transaction(conn):
+            # Again, in case another approval got in first.
+            check_room(conn, cfg, ask["engine"])
+            check_place(conn, target)
+            claimed = conn.execute("UPDATE asks SET status = 'approved', decided_at = ?, decided_via = ? "
+                                   "WHERE id = ? AND status = 'pending'", (at, via, ask["id"]))
+            if claimed.rowcount != 1:
+                raise RunError("That request was already answered.")
+            if conn.execute("UPDATE ideas SET status = 'running', updated_at = ? WHERE id = ? AND status = 'open'",
+                            (at, idea["id"])).rowcount != 1:
+                raise RunError(f"Idea #{idea['id']} is no longer open.")
+            run_id = conn.execute(
+                "INSERT INTO runs(ask_id, idea_id, engine, workdir, budget_tokens, deadline_at, effort, status, "
+                "created_at, model, project, workspace, branch) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?)",
+                (ask["id"], idea["id"], ask["engine"], str(prepared["workdir"]), ask["budget_tokens"], deadline,
+                 ask["effort"], at, ask["model"], str(prepared["project"]) if prepared["project"] else None,
+                 prepared["kind"], prepared["branch"])).lastrowid
+            conn.execute("UPDATE asks SET run_id = ? WHERE id = ?", (run_id, ask["id"]))
+    except BaseException:
+        workspace.discard(prepared)  # nothing is left behind for a run that didn't start
+        raise
     launch(conn, run_id)
     return get(conn, run_id)
 
@@ -366,25 +414,37 @@ def run_targets(conn, run_id: int, pid: int | None, start: str | None) -> dict:
 
 
 def enforce_stop(conn, cfg: dict, run, reason: str) -> dict:
-    run_id = run["id"]
-    conn.execute(f"UPDATE runs SET status = 'stopping', stop_requested_at = COALESCE(stop_requested_at, ?), "
-                 f"stop_reason = COALESCE(stop_reason, ?) WHERE id = ? AND status IN {ACTIVE_SQL}",
-                 (now(), reason, run_id))
-    pid, start = run["worker_pid"], run["worker_lstart"]
-    # 1. Let the worker wind down: it interrupts the agent's turn and stops its engine.
-    if proctree.alive(pid, start):
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-        deadline = time.monotonic() + cfg["runs"]["stopGraceSeconds"]
-        while time.monotonic() < deadline and proctree.alive(pid, start):
-            proctree.reap()
-            time.sleep(0.25)
+    return enforce_stops(conn, cfg, [run], reason)[0]
+
+
+def enforce_stops(conn, cfg: dict, stopping: list, reason: str) -> list:
+    """Stop runs for good. Every worker is told first, so several runs wind down side by side."""
+    if not stopping:
+        return []
+    for run in stopping:
+        conn.execute(f"UPDATE runs SET status = 'stopping', stop_requested_at = COALESCE(stop_requested_at, ?), "
+                     f"stop_reason = COALESCE(stop_reason, ?) WHERE id = ? AND status IN {ACTIVE_SQL}",
+                     (now(), reason, run["id"]))
+        # 1. Let the worker wind down: it interrupts the agent's turn and stops its engine.
+        if proctree.alive(run["worker_pid"], run["worker_lstart"]):
+            try:
+                os.kill(run["worker_pid"], signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+    deadline = time.monotonic() + cfg["runs"]["stopGraceSeconds"]
+    while time.monotonic() < deadline:
+        procs = proctree.snapshot()
+        if not any(proctree.alive(run["worker_pid"], run["worker_lstart"], procs) for run in stopping):
+            break
+        proctree.reap()
+        time.sleep(0.25)
     # 2. Enforce regardless of cooperation, then verify.
-    targets = run_targets(conn, run_id, pid, start)
-    survivors = proctree.terminate(targets, grace=2)
-    return finalize(conn, run_id, survivors, len(targets), default_outcome="stopped")
+    results = []
+    for run in stopping:
+        targets = run_targets(conn, run["id"], run["worker_pid"], run["worker_lstart"])
+        survivors = proctree.terminate(targets, grace=2)
+        results.append(finalize(conn, run["id"], survivors, len(targets), default_outcome="stopped"))
+    return results
 
 
 def finalize(conn, run_id: int, survivors: list, tracked: int, default_outcome: str,
@@ -426,7 +486,7 @@ def stop(conn, cfg: dict, run_id: int | None = None, reason: str = "user") -> di
     else:
         run = get(conn, run_id)
         targets = [run] if run is not None and run["status"] in ACTIVE else []
-    return {"runs": [enforce_stop(conn, cfg, run, reason) for run in targets], "declined": declined}
+    return {"runs": enforce_stops(conn, cfg, targets, reason), "declined": declined}
 
 
 def describe_stop(results: dict) -> str:
@@ -478,10 +538,52 @@ def supervise(conn, cfg: dict, at: float | None = None) -> None:
         finalize(conn, run["id"], survivors, len(targets), default_outcome="failed")
 
 
+def over_the_line(cfg: dict, engine: str, data: dict) -> str | None:
+    """Why a subscription's runs must stop now, from a live reading: it's below the share you keep, or paid usage
+    could start. Anything unknown is no reason."""
+    paid = data.get("paidUsage") or {}
+    if engine == "claude" and paid.get("enabled") is True:
+        return "Claude extra usage (paid) was turned on"
+    if engine == "codex" and paid.get("possible") is True:
+        return "Codex could now spend purchased credits"
+    floor = cfg["runs"]["keepPercent"]
+    for w in data.get("windows") or []:
+        left = w.get("remainingPercent")
+        if left is not None and left < floor:
+            return (f"{engine_name(engine)}'s {(w.get('label') or w['id']).lower()} limit is down to {left:g}% "
+                    f"left (you keep at least {floor}%)")
+    return None
+
+
+def guard(conn, cfg: dict) -> list:
+    """Several runs at once can spend capacity faster than any one run's budget suggests, so while runs are
+    working, read each subscription's usage live and stop its runs if it's over the line. Returns the ids stopped."""
+    stopped = []
+    for engine in sorted({r["engine"] for r in working(conn)}):
+        try:
+            data = snapshot_for(cfg, engine)
+        except RunError:
+            continue
+        if data.get("state") != "live":
+            continue  # an unknown reading stops nothing
+        reason = over_the_line(cfg, engine, data)
+        if reason is None:
+            continue
+        going = working(conn, engine)  # read again: runs may have ended during the reading
+        enforce_stops(conn, cfg, going, reason)
+        # Only runs this stopped: not ones that ended on their own meanwhile, or that someone else was stopping.
+        ids = [r["id"] for r in going if get(conn, r["id"])["stop_reason"] == reason]
+        if ids:
+            stopped += ids
+            notify.enqueue(conn, "run-end", f"{reason}, so I stopped " + ("runs " if len(ids) > 1 else "run ")
+                           + ", ".join(f"#{i}" for i in ids) + ".", dedupe_key=f"guard:{engine}:{ids}")
+    return stopped
+
+
 def reconcile_on_start(conn, cfg: dict) -> list:
     """After a restart, a run's lease can't be revalidated, so every active run is stopped."""
-    return [enforce_stop(conn, cfg, run, "Reset restarted; runs default to stopped")
-            for run in conn.execute(f"SELECT * FROM runs WHERE status IN {ACTIVE_SQL}").fetchall()]
+    return enforce_stops(conn, cfg, conn.execute(f"SELECT * FROM runs WHERE status IN {ACTIVE_SQL}").fetchall(),
+                         "Reset restarted; runs default to stopped")
 
 
 def summary_text(conn, at: float | None = None) -> str:

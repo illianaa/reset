@@ -521,9 +521,9 @@ def hold(conn, run_id: int, engine: Engine, stop: threading.Event, tracker: PidT
     """Keep a finished run's live chat open while you're in the Claude app, so it never vanishes in front of you.
 
     It closes (and then moves to Claude Desktop) once you've left the app and the chat has gone quiet, or when you
-    ask for it, stop it, start another run, or its time or token limit is reached. Anything said in it meanwhile
-    runs in this same process, under the same limits. Returns "stopped", "deadline" or "budget" when that's why
-    it closed.
+    ask for it, stop it, or its time or token limit is reached. Other runs start beside it. Anything said in it
+    meanwhile runs in this same process, under the same limits. Returns "stopped", "deadline" or "budget" when
+    that's why it closed.
     """
     checked = 0.0
     while engine.process.poll() is None:
@@ -684,12 +684,14 @@ def main(run_id: int) -> int:
         engine.close()
         survivors = proctree.terminate(tracker.targets(), grace=3)
         at = now()
+        # A Claude run that wasn't shown in the apps stays out of Claude Desktop, even if showing is turned on later.
+        hidden = "not-shown" if run["engine"] == "claude" and not cfg["runs"]["showInApps"] else None
         conn.execute("UPDATE runs SET status = 'done', outcome = COALESCE(outcome, ?), summary = COALESCE(summary, ?), "
                      "error = COALESCE(error, ?), tokens_used = ?, tokens_total = ?, ended_at = ?, cleanup = ?, "
-                     "thread_id = COALESCE(thread_id, ?) WHERE id = ?",
+                     "thread_id = COALESCE(thread_id, ?), handoff = COALESCE(handoff, ?) WHERE id = ?",
                      (outcome or "failed", (engine.summary or "").strip()[:4000] or None, error or engine.error,
                       engine.tokens_used, engine.tokens_total, at, json.dumps({"workerSurvivors": survivors}),
-                      engine.thread_id, run_id))
+                      engine.thread_id, hidden, run_id))
         ideas.set_status(conn, idea["id"], "done" if outcome == "completed" else "open")
         latest = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         if latest["stop_requested_at"] is None and not announced:  # user stops get their own confirmation

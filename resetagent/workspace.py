@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import time
 
@@ -68,17 +69,18 @@ def _inside(path: Path, root: Path) -> bool:
 
 
 def allowed(cfg: dict, path: Path) -> bool:
-    """Runs may work in a project folder or elsewhere in your home folder, never in system or hidden places."""
+    """Runs may work in a project folder or elsewhere in your home folder, never in system or hidden places, and
+    never where Reset keeps its own settings (wherever the projects folder is)."""
     path = path.expanduser().resolve()  # resolves ".." and symlinks before any check
-    home, root = Path.home().resolve(), projects_root(cfg).resolve()
-    if path in (home, root):
+    home, root, reset = Path.home().resolve(), projects_root(cfg).resolve(), config.home().resolve()
+    if path in (home, root) or _inside(path, reset) or _inside(reset, path):
         return False
     if _inside(path, root):
         return True
     if not _inside(path, home):
         return False
     first = path.relative_to(home).parts[0]
-    return not first.startswith(".") and first != "Library" and not _inside(path, config.home().resolve())
+    return not first.startswith(".") and first != "Library"
 
 
 def resolve(cfg: dict, project) -> dict:
@@ -113,13 +115,31 @@ def resolve(cfg: dict, project) -> dict:
     return {"kind": "new", "path": path, "label": f"new project folder {short(path)}"}
 
 
+def _fresh(path: Path) -> Path:
+    """path, or path-2, path-3… when it's taken (runs can start in the same second)."""
+    candidate, n = path, 1
+    while candidate.exists():
+        n += 1
+        candidate = path.with_name(f"{path.name}-{n}")
+    return candidate
+
+
+def _fresh_branch(repo: Path, branch: str) -> str:
+    candidate, n = branch, 1
+    while _git(["rev-parse", "--verify", "-q", f"refs/heads/{candidate}"], repo).returncode == 0:
+        n += 1
+        candidate = f"{branch}-{n}"
+    return candidate
+
+
 def prepare(cfg: dict, idea, target: dict) -> dict:
-    """Create the run's working folder. Returns {"workdir", "branch", "kind", "project"}."""
+    """Create the run's working folder. Returns {"workdir", "branch", "kind", "project"} (plus "repo" and "tree" for
+    a worktree)."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
     kind, project = target["kind"], target["path"]
     runs_root = Path(cfg["runs"]["root"]).expanduser()
     if kind == "scratch":
-        workdir = runs_root / f"{stamp}-idea{idea['id']}-{slug(idea['title'])}"
+        workdir = _fresh(runs_root / f"{stamp}-idea{idea['id']}-{slug(idea['title'])}")
         workdir.mkdir(parents=True)
         (workdir / "IDEA.md").write_text(f"# Idea #{idea['id']}\n\n{idea['text']}\n")
         _git(["init", "-q"], workdir)
@@ -131,16 +151,27 @@ def prepare(cfg: dict, idea, target: dict) -> dict:
         return {"workdir": project, "branch": None, "kind": kind, "project": project}
     if kind == "repo":
         repo = target["repo"]
-        branch = f"reset/{slug(idea['title'], 30)}-{stamp}"
-        tree = runs_root.parent / "worktrees" / f"{repo.name}-{stamp}"
+        branch = _fresh_branch(repo, f"reset/{slug(idea['title'], 30)}-{stamp}")
+        tree = _fresh(runs_root.parent / "worktrees" / f"{repo.name}-{stamp}")
         tree.parent.mkdir(parents=True, exist_ok=True)
         result = _git(["worktree", "add", "-q", "-b", branch, str(tree), "HEAD"], repo)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip().splitlines()
             raise WorkspaceError(f"Couldn't set up a branch in {short(repo)}: {detail[-1] if detail else 'git failed'}")
         inside = project.resolve().relative_to(repo.resolve())  # a subfolder keeps its place in the worktree
-        return {"workdir": tree / inside, "branch": branch, "kind": kind, "project": project}
+        return {"workdir": tree / inside, "branch": branch, "kind": kind, "project": project, "repo": repo,
+                "tree": tree}
     return {"workdir": project, "branch": None, "kind": kind, "project": project}
+
+
+def discard(prepared: dict) -> None:
+    """Undo prepare() for a run that didn't start: its scratch folder, or its worktree and branch, go. A project
+    folder stays, since another run may be working there."""
+    if prepared["kind"] == "scratch":
+        shutil.rmtree(prepared["workdir"], ignore_errors=True)
+    elif prepared["kind"] == "repo":
+        _git(["worktree", "remove", "--force", str(prepared["tree"])], prepared["repo"])
+        _git(["branch", "-D", prepared["branch"]], prepared["repo"])
 
 
 def branch_work(run) -> dict:
