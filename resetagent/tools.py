@@ -8,7 +8,7 @@ from __future__ import annotations
 import contextlib
 from pathlib import Path
 
-from resetagent import config, db, ideas, models, runs, status, workspace
+from resetagent import apps, config, db, ideas, models, runs, status, workspace
 from resetagent.providers.common import describe
 from resetagent.timeutil import local, now, parse_iso, span
 
@@ -126,7 +126,11 @@ def get_run(conn, run: int) -> dict:
               "duration": span((r["ended_at"] or at) - started), "tokensUsed": r["tokens_used"],
               "tokenBudget": r["budget_tokens"], "timesBlocked": r["blocked"],
               "agentLastMessage": (r["summary"] or "")[:3000] or None, "error": r["error"],
-              "folder": workspace.short(root), "notes": notes}
+              "folder": workspace.short(root), "notes": notes, "watchLive": r["live_url"],
+              "inTheApp": {"codex": "pinned in the Codex app, to continue any time; open_run opens it",
+                           "claude": "moves to Claude Desktop's Code tab once done (while the user is away), to "
+                                     "continue any time; open_run opens it now" if apps.desktop() else None
+                           }.get(r["engine"])}
     if r["branch"]:  # an existing codebase: what's on the run's branch is its work
         report.update(project=workspace.short(r["project"]), **workspace.branch_work(r))
     else:
@@ -163,6 +167,11 @@ def propose_run(conn, idea: int, engine: str | None = None, model: str | None = 
             "expires": local(ask["expires_at"]),
             "note": "The user was sent the request (with the reason for this engine) and Start/Skip buttons. "
                     "Only they can start it."}
+
+
+def open_run(conn, run: int) -> dict:
+    r = runs.get(conn, int(run))
+    return {"result": apps.open_run(conn, r) if r else f"No run #{run}."}
 
 
 def stop_runs(conn, run: int | None = None) -> dict:
@@ -215,6 +224,9 @@ TOOLS = {
                                                                         "e.g. gpt-5.6-sol or fable."},
                              "effort": {"type": "string", "enum": list(models.EFFORTS)}, "project": PROJECT,
                              "budget_tokens": {"type": "integer"}, "minutes": {"type": "integer"}}, ["idea"])),
+    "open_run": (open_run, "Open a run's chat in its desktop app (Codex or Claude) on the user's Mac, so they can "
+                 "read it or continue it there. A Claude run can only move to Claude Desktop once it's done.",
+                 _schema({"run": {"type": "integer"}}, ["run"])),
     "stop_runs": (stop_runs, "Stop running work right away (one run by number, or everything) and cancel pending "
                   "requests.", _schema({"run": {"type": "integer"}})),
 }

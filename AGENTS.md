@@ -45,6 +45,12 @@ Ground rules:
    - Every run still needs their OK, has a token budget and a deadline, and can be stopped at once. Work on an existing codebase happens on a new branch in its own git worktree, never in their checkout.
    - If they prefer, use `--access sandboxed`: runs can change files in their own folder, and anything else (the network, installs, git commits) is refused. Runs never wait for an answer either way; Reset texts the user when a run is refused something.
    - If Claude runs fail because bypass-permissions mode is turned off (some organizations disable it), switch to sandboxed.
+   - Runs show up as chats in the user's apps, to read and continue later like any chat they started.
+     - Codex threads are named "Reset #N: …" and pinned in the Codex app.
+     - Claude runs turn on Claude Code's Remote Control, so the user can watch them live in the Claude app and on their phone.
+     - When a Claude run is done, its live chat stays open while the user is in the Claude app. Once they leave the app, Reset hands it to Claude Desktop, the same way `/desktop` does (macOS only).
+     - Remote Control needs a Claude plan login. On Team and Enterprise plans, an admin has to allow it.
+     - If it's unavailable, runs still work, and Reset says so.
 
 6. **Start the background service:** `resetctl setup service`
    - This installs a LaunchAgent on macOS or a systemd user service on Linux.
@@ -66,6 +72,7 @@ The Reset skill (`skills/reset/SKILL.md`) explains the day-to-day commands. The 
 - `resetctl propose <idea#> [--engine] [--model] [--effort] [--project]`
 - `resetctl models`
 - `resetctl runs`
+- `resetctl open <run#>`
 - `resetctl stop`
 - `resetctl ask "…"`
 
@@ -82,6 +89,7 @@ Python 3.9+, standard library only (no dependencies), macOS and Linux.
 | `resetagent/tools.py`, `mcp.py` | The brain's tools, served over MCP (stdio) |
 | `resetagent/runs.py`, `worker.py`, `proctree.py` | Run requests (engine routing), one supervised worker per run, enforced and verified cancellation |
 | `resetagent/models.py`, `workspace.py` | Live model and effort lists per engine; where a run works (scratch folder, new project, git worktree) and the brief the agent gets |
+| `resetagent/apps.py` | Runs as chats in the desktop apps: pinned Codex threads, live Claude runs over Remote Control, finished Claude runs handed to Claude Desktop, and the links that open a run's chat |
 | `resetagent/providers/` | Reading usage: Codex app-server; Claude Code `get_usage`; Claude Desktop's cached reset grants |
 | `resetagent/monitor.py`, `notify.py`, `channels/` | Notification rules, durable outbox, Telegram (plus local and iMessage) delivery |
 | `resetagent/status.py`, `ideas.py`, `db.py`, `config.py` | Usage snapshots, the idea list, SQLite state in `~/.reset/`, settings |

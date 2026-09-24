@@ -14,7 +14,7 @@ import threading
 import time
 import traceback
 
-from resetagent import brain, channels, commands, config, db, monitor, notify, proctree, runs, status
+from resetagent import apps, brain, channels, commands, config, db, monitor, notify, proctree, runs, status
 from resetagent.channels.base import ChannelError, ChannelUnavailable
 from resetagent.providers.common import describe
 from resetagent.timeutil import iso, now
@@ -31,6 +31,7 @@ class Daemon:
     def __init__(self):
         self.stopping = False
         self.last_status = 0.0
+        self.last_sweep = 0.0
         self.channel_problems: dict = {}
 
     def step(self, label: str, fn, *args):
@@ -93,6 +94,11 @@ class Daemon:
             self.step("commands", commands.process_pending, conn, cfg)
             self.step("asks", runs.expire_asks, conn)
             self.step("supervise", runs.supervise, conn, cfg)
+            if time.time() - self.last_sweep >= 5:  # finished Claude runs move to Claude Desktop
+                self.last_sweep = time.time()
+                handed = self.step("apps", apps.sweep, conn, cfg)
+                if handed:
+                    log(f"run #{handed} handed to Claude Desktop")
             due = time.time() - self.last_status >= cfg["monitor"]["statusMinutes"] * 60
             if due or db.kv_get(conn, "status:refresh"):
                 db.kv_delete(conn, "status:refresh")
