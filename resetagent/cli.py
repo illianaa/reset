@@ -132,7 +132,7 @@ def cmd_approve(args) -> int:
         run = runs.approve(conn, config.load(), args.code, via="terminal")
     except runs.RunError as exc:
         return fail(str(exc))
-    print(f"Started run #{run['id']} (stops by {local(run['deadline_at'])}). Stop it with `resetctl stop`.")
+    print(f"Started run #{run['id']} (stops by {local(run['deadline_at'])}). Stop it with `resetctl stop {run['id']}`.")
     return 0
 
 
@@ -147,7 +147,8 @@ def cmd_stop(args) -> int:
     conn = db.connect()
     target = None if args.run in (None, "all") else int(args.run)
     results = runs.stop(conn, config.load(), run_id=target, reason="stop from terminal")
-    print(runs.describe_stop(results) if results["runs"] or results["declined"] else "Nothing is running.")
+    print(runs.describe_stop(results) if results["runs"] or results["declined"] else
+          "Nothing is running." if target is None else f"Run #{target} isn't running.")
     return 0
 
 

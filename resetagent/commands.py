@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-from resetagent import apps, brain, db, ideas, notify, runs, status
+from resetagent import apps, brain, config, db, ideas, notify, runs, settings, status
 from resetagent.providers.common import describe
 from resetagent.timeutil import local, now, span
 
@@ -18,8 +18,9 @@ HELP = ("Reset commands:\n"
         "run <#> · I'll ask before starting it, on the subscription that expires soonest\n"
         "run <#> on codex with sol at xhigh · pick the engine, model or effort\n"
         "yes <code> / no <code> · answer a request\n"
-        "runs · what's running · stop · stop everything\n"
-        "open <run#> · open a run's chat in the Codex or Claude app on your Mac")
+        "runs · what's running · stop <#> · stop one run · stop · stop everything\n"
+        "open <run#> · open a run's chat in the Codex or Claude app on your Mac\n"
+        "floor <n>% · the share of each usage limit runs leave alone")
 
 
 @dataclass
@@ -42,6 +43,8 @@ PATTERNS = [
     (re.compile(r"^stop(?:\s+(?:run\s+)?#?(\d+|all))?[.!]?$", re.I), "stop"),
     (re.compile(r"^(?:runs|jobs)\??$", re.I), "runs"),
     (re.compile(r"^(?:open|show)\s+(?:run\s+)?#?(\d+)(?:\s+in\s+(?:the\s+)?(?:codex|claude|app))?[.!]?$", re.I), "open"),
+    (re.compile(r"^(?:floor|keep)(?:\s+(?:at\s+)?(\d+)\s*%?)?[.!?]?$", re.I), "floor"),
+    (re.compile(r"^undo\s+([0-9a-f]{8})$", re.I), "undo"),
     (re.compile(r"^(?:drop|remove|delete)\s+(?:idea\s+)?#?(\d+)$", re.I), "drop"),
     (re.compile(r"^(?:ok|buzzed|got it)\s+(\d{4})$", re.I), "delivery-buzz"),
     (re.compile(r"^(?:quiet|silent)\s+(\d{4})$", re.I), "delivery-silent"),
@@ -136,7 +139,7 @@ def handle(conn, cfg: dict, row, command: Command) -> str | None:
             where = " I'll send a link to watch it live in the Claude app."
         return (f"Started run #{run['id']} on {run['engine'].capitalize()}. It stops by "
                 f"{local(run['deadline_at'])} or at {run['budget_tokens'] // 1000}k tokens.{where} "
-                "Send “stop” to stop it now.")
+                f"Send “stop {run['id']}” to stop it now, or “stop” to stop everything.")
     if kind == "approve-missing-code":
         return "Include the 4-digit code from the request, like “yes 1234”, so I start the right thing."
     if kind == "switch":
@@ -151,13 +154,17 @@ def handle(conn, cfg: dict, row, command: Command) -> str | None:
         target = None if command.arg in (None, "all") else int(command.arg)
         results = runs.stop(conn, cfg, run_id=target, reason=f"stop from {channel}")
         if not results["runs"] and not results["declined"]:
-            return "Nothing is running."
+            return "Nothing is running." if target is None else f"Run #{target} isn't running."
         return runs.describe_stop(results)
     if kind == "runs":
         return runs.summary_text(conn)
     if kind == "open":
         run = runs.get(conn, int(command.arg))
         return apps.open_run(conn, run) if run else f"No run #{command.arg}."
+    if kind == "floor":
+        return floor(cfg, command.arg)
+    if kind == "undo":  # the Undo button under a change Reset's AI made
+        return settings.undo(conn, command.arg.lower())
     if kind == "drop":
         return f"Removed idea #{command.arg}." if ideas.drop(conn, int(command.arg)) else \
             f"Couldn't remove idea #{command.arg} (missing or running)."
@@ -174,6 +181,24 @@ def handle(conn, cfg: dict, row, command: Command) -> str | None:
         command.kind = "brain"
         return None  # the brain thread replies
     return "I didn't catch that. " + HELP
+
+
+def floor(cfg: dict, value: str | None) -> str:
+    """Show or set the share of each usage limit runs leave alone. The user's own command, so no model is needed
+    (the brain can change it too, with change_setting, and Reset announces that change with an Undo button)."""
+    if value is None:
+        return (f"Runs leave at least {cfg['runs']['keepPercent']}% of every usage limit untouched: none starts "
+                "below that, and running ones stop if a subscription drops under it. To change it, send "
+                "“floor 8” (any number from 0 to 100).")
+    share = int(value)
+    if share > 100:
+        return "The floor is a percentage from 0 to 100."
+    with config.editing() as saved:
+        saved["runs"]["keepPercent"] = share
+    cfg["runs"]["keepPercent"] = share
+    if share == 0:
+        return "Done: runs may now use everything that's left of your limits."
+    return f"Done: runs now leave at least {share}% of every usage limit untouched."
 
 
 def record_delivery(conn, channel: str, code: str, result: str) -> str:

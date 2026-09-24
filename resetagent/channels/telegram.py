@@ -18,9 +18,11 @@ API_BASE = "https://api.telegram.org"
 LIMIT = 4000  # Telegram allows 4096 characters per message
 COMMANDS = [("status", "Usage limits and one-time resets"), ("ideas", "Your idea list"),
             ("idea", "Save an idea: /idea <text>"), ("runs", "Active and recent runs"),
-            ("stop", "Stop everything now"), ("help", "What I can do")]
+            ("stop", "Stop everything now"), ("floor", "Share of each limit runs leave alone"),
+            ("help", "What I can do")]
 CALLBACK = re.compile(r"ask:(\d+):([0-9a-f]{8}):([ynx])")
 OPEN = re.compile(r"run:(\d+):open")  # "Open in Codex/Claude" under a finished run
+UNDO = re.compile(r"undo:([0-9a-f]{8})")  # "Undo" under a setting Reset's AI changed
 TAPS = {"y": ("yes", "Starting…"), "n": ("no", "Skipped."), "x": ("switch", "Switching…")}
 
 
@@ -135,10 +137,15 @@ class Telegram:
         chat_id = (message.get("chat") or {}).get("id")
         saved, reply = 0, "Only the paired account can do that."
         opening = OPEN.fullmatch(query.get("data") or "")
+        undoing = UNDO.fullmatch(query.get("data") or "")
         if opening and self.owner(chat_id, (query.get("from") or {}).get("id")):
             saved = int(persist_inbound(conn, self.name, f"cb:{query['id']}", str(query["from"]["id"]),
                                         f"open {opening.group(1)}", now()))
             reply = "Opening it on your Mac…"
+        elif undoing and self.owner(chat_id, (query.get("from") or {}).get("id")):
+            saved = int(persist_inbound(conn, self.name, f"cb:{query['id']}", str(query["from"]["id"]),
+                                        f"undo {undoing.group(1)}", now()))
+            reply = "Undoing…"
         elif self.owner(chat_id, (query.get("from") or {}).get("id")):
             reply = "That request is no longer valid."
             match = CALLBACK.fullmatch(query.get("data") or "")

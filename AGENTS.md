@@ -87,9 +87,10 @@ Python 3.9+, standard library only (no dependencies), macOS and Linux.
 | `resetagent/commands.py` | Handles exact commands (`/stop`, approvals, `/idea`…) without any model; free text goes to the brain |
 | `resetagent/brain.py` | Optional AI brain: Claude Code / Codex CLIs with Reset's tools, fallback order, provider-neutral conversation |
 | `resetagent/tools.py`, `mcp.py` | The brain's tools, served over MCP (stdio) |
-| `resetagent/runs.py`, `worker.py`, `proctree.py` | Run requests (engine routing), one supervised worker per run, enforced and verified cancellation |
+| `resetagent/runs.py`, `worker.py`, `proctree.py` | Run requests (engine routing, room on each subscription), one supervised worker per run (several run at once), the usage floor while runs work, enforced and verified cancellation |
 | `resetagent/models.py`, `workspace.py` | Live model and effort lists per engine; where a run works (scratch folder, new project, git worktree) and the brief the agent gets |
 | `resetagent/apps.py` | Runs as chats in the desktop apps: pinned Codex threads, live Claude runs over Remote Control, finished Claude runs handed to Claude Desktop, and the links that open a run's chat |
+| `resetagent/settings.py` | The settings users tune by chatting with the brain (a fixed list, each value checked), announced with an Undo button |
 | `resetagent/providers/` | Reading usage: Codex app-server; Claude Code `get_usage`; Claude Desktop's cached reset grants |
 | `resetagent/monitor.py`, `notify.py`, `channels/` | Notification rules, durable outbox, Telegram (plus local and iMessage) delivery |
 | `resetagent/status.py`, `ideas.py`, `db.py`, `config.py` | Usage snapshots, the idea list, SQLite state in `~/.reset/`, settings |
@@ -98,13 +99,15 @@ Invariants. Keep these true in every change:
 
 1. **Anything that must work at 0% usage never calls a model.** That covers saving ideas, stop, approvals, alerts and status. Only free-form chat and run summaries use a brain, and they fall back to commands.
 2. **Reset never handles AI credentials.** It drives the official `codex` and `claude` CLIs, and it doesn't read tokens from keychains or auth files.
-3. **Only the user approves runs**, with a code, a Telegram button, or `resetctl approve` in a real terminal. Brains get `tools.py` and nothing more: no approve, redeem or settings tools.
+3. **Only the user approves runs**, with a code, a Telegram button, or `resetctl approve` in a real terminal. Brains get `tools.py` and nothing more: no approve or redeem tools.
+   - The settings a brain can change are a fixed list in `settings.py`, and each value is checked.
+   - Reset announces every change a brain makes in its own message, with an Undo button, so no setting changes without the user seeing it.
 4. **Reset redemption is manual.** The Codex client blocks the redeem method (`FORBIDDEN` in `providers/codex.py`).
 5. **Stopping is enforced, not requested.** The supervisor kills every process a run was seen to spawn, identified by pid and start time, and verifies that none survived. After a restart, runs default to stopped.
 6. **The conversation is provider-neutral.** It's stored as plain text, and brain calls are stateless, so any model can answer the next message.
 7. **Unknown stays unknown.** Missing percentages or expiries are `None`, never 0. Cached data never authorizes a run.
 
-Settings: `~/.reset/config.json`, written by `resetctl setup`. Optional environment overrides are listed in `.env.example` and registered in `config.ENV_VARS`. Read them only through `config.env()`, which rejects unregistered names. Never commit secrets or personal data: `.env`, `~/.reset` and local notes are git-ignored.
+Settings: `~/.reset/config.json`, written by `resetctl setup`, and by `settings.py` and the `floor` command when the user tunes Reset by chatting. Optional environment overrides are listed in `.env.example` and registered in `config.ENV_VARS`. Read them only through `config.env()`, which rejects unregistered names. Never commit secrets or personal data: `.env`, `~/.reset` and local notes are git-ignored.
 
 **Adding a subscription provider** (e.g. another coding agent with plan limits):
 

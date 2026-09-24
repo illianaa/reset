@@ -34,6 +34,8 @@ Runs need explicit approval from the user every time. In this version Reset neve
 
 Each run is a single agent turn with a token budget and a deadline. It ends before any usage window resets. Reset refuses to start a run when usage can't be read live, when paid overage could kick in, or when too little remains.
 
+Several runs can go at once, by default up to 3 on each subscription. When one is full, a new request goes to the other. While runs are working, Reset rechecks usage every few minutes. If a subscription drops below the share the user keeps (5% of every limit by default), or paid usage turns on, it stops that subscription's runs. The user changes that share, and Reset's other settings, by asking Reset's AI in their chat (or by sending `floor <n>`). Reset confirms each change it makes, with an Undo button.
+
 Runs show up as chats in the user's apps, to read and continue any time. Codex runs are pinned in the Codex app as "Reset #N: …". Claude runs can be watched live in the Claude app (Reset texts the user the link), and once done they move into Claude Desktop's Code tab as soon as the user leaves the Claude app.
 
 Runs have full access by default (`resetctl setup access` changes it), so they don't stall on permission prompts. If a run is refused something, or asks a question nobody is there to answer, Reset tells the user right away.
