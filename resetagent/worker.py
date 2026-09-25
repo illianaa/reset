@@ -45,12 +45,15 @@ def run_tools_config(run_id: int) -> list:
     def toml(value):
         return json.dumps(value, ensure_ascii=False)
 
-    env = "{" + ", ".join(f"{key} = {toml(value)}" for key, value in
-                          (("RESET_HOME", str(config.home())), ("PYTHONPATH", str(ROOT)))) + "}"
+    # A trusted repo's own Codex config can add to this server's environment, so it starts from an empty one
+    # (env -i), and Python ignores PYTHON* settings and user packages (-E -s) and reads UTF-8 (-X utf8).
+    python = [sys.executable, "-E", "-s", "-X", "utf8", "-m", "resetagent", "ask-server", str(run_id)]
+    command = ["/usr/bin/env", "-i", f"RESET_HOME={config.home()}", *python] if Path("/usr/bin/env").exists() \
+        else python
+    env = "{" + f"RESET_HOME = {toml(str(config.home()))}" + "}"
     server = f"mcp_servers.{asking.RUN_SERVER}"
-    # -E -s: no PYTHON* settings or user packages, which a project's own Codex config could add to its env
-    return ["-c", f"{server}.command={toml(sys.executable)}",
-            "-c", f"{server}.args={toml(['-E', '-s', '-m', 'resetagent', 'ask-server', str(run_id)])}",
+    return ["-c", f"{server}.command={toml(command[0])}",
+            "-c", f"{server}.args={toml(command[1:])}",
             "-c", f"{server}.cwd={toml(str(ROOT))}",
             "-c", f"{server}.env={env}",
             "-c", f"{server}.enabled=true",
@@ -169,13 +172,16 @@ class CodexEngine(Engine):
             raise RuntimeError("Codex CLI not found")
         workdir = self.run["workdir"]
         wait = asking.wait_seconds(self.cfg)
+        access = self.cfg["runs"]["access"]
+        full = access == "full"
         # The user's connectors, plugins and MCP servers that runs may not use are switched off for this process.
         limits = runtools.codex_limits(executable, self.cfg, workdir)
+        if not full:  # a trusted repo's own Codex config can't widen the sandbox, or run things outside it
+            limits += ["-c", "sandbox_workspace_write.writable_roots=[]",
+                       "-c", "sandbox_workspace_write.network_access=false", "-c", "notify=[]", "--disable", "hooks"]
         self.client = codex.AppServer(executable, allowed=codex.RUN_METHODS, cwd=workdir,
                                       extra_args=limits + (run_tools_config(self.run["id"]) if wait > 0 else []))
         codex.initialize(self.client, "reset_run")
-        access = self.cfg["runs"]["access"]
-        full = access == "full"
         tools = runtools.describe(runtools.allowed(self.cfg))
         thread = {"cwd": workdir, "developerInstructions": workspace.brief(self.run, access, wait / 60, tools),
                   "approvalPolicy": "never" if full else "on-request",
@@ -445,8 +451,10 @@ class ClaudeEngine(StreamEngine):
         if self.cfg["runs"]["access"] == "full":
             args += ["--permission-mode", "bypassPermissions"]
         else:
-            # acceptEdits takes edits inside the run's folder; an edit anywhere else asks (or is refused)
-            args += ["--permission-mode", "acceptEdits", "--allowedTools", "Read,Glob,Grep"]
+            # acceptEdits takes edits inside the run's folder; an edit anywhere else asks (or is refused). Only the
+            # user's own settings load: a repo's .claude settings could run hooks, or servers, outside the sandbox.
+            args += ["--permission-mode", "acceptEdits", "--allowedTools", "Read,Glob,Grep",
+                     "--setting-sources", "user"]
         if self.run["model"]:
             args += ["--model", self.run["model"]]
         if self.run["effort"]:
@@ -458,7 +466,7 @@ class ClaudeEngine(StreamEngine):
         if not executable:
             raise RuntimeError("Claude Code CLI not found")
         self.spawn(self.args(executable), self.run["workdir"], stdin=subprocess.PIPE)
-        self.local_servers = runtools.project_servers(self.run["workdir"])
+        self.local_servers = runtools.project_servers(self.run["workdir"]) or frozenset()  # (None: none load)
         self.control("initialize", hooks=runtools.CLAUDE_HOOKS)  # Claude Code checks each MCP tool call (hooked)
         if self.cfg["runs"]["showInApps"]:
             # The live view ends with the run; the finished chat moves to Claude Desktop (apps.sweep).

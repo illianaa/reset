@@ -79,16 +79,19 @@ def describe(names) -> str:
 # --- Codex ---------------------------------------------------------------------------------------------------
 
 def codex_inventory(executable: str, cwd: str | None = None) -> dict:
-    """The user's MCP servers, plugins and connectors, as a Codex started in cwd would load them."""
+    """The user's MCP servers, plugins and connectors, as a Codex started in cwd would load them. "local": the
+    servers only the folder's own Codex config (a trusted repo's) adds."""
     client = codex.AppServer(executable, allowed=SCOUT_METHODS, cwd=cwd)
     try:
         codex.initialize(client, "reset_tools")
         read = client.call("config/read", {"cwd": cwd} if cwd else {}, timeout=20)
+        user = client.call("config/read", {}, timeout=20) if cwd else read
         plugins = client.call("plugin/installed", {}, timeout=20)
         apps = client.call("app/installed", {}, timeout=20)
     finally:
         client.close()
-    if not isinstance((read or {}).get("config"), dict) or not isinstance(plugins, dict) or not isinstance(apps, dict):
+    if not all(isinstance((r or {}).get("config"), dict) for r in (read, user)) or not isinstance(plugins, dict) \
+            or not isinstance(apps, dict):
         raise ToolsError("Codex didn't report its tools")  # (so nothing is left on by mistake)
     config = read["config"]
     installed = [f"{p['name']}@{m['name']}" for m in plugins.get("marketplaces") or [] for p in m.get("plugins") or []
@@ -97,8 +100,9 @@ def codex_inventory(executable: str, cwd: str | None = None) -> dict:
     for app in config.get("apps") or {}:  # a connector the config names is on unless switched off, even if unlisted
         if app != "_default":
             connectors.setdefault(app, app)
-    return {"servers": sorted(name for name, server in (config.get("mcp_servers") or {}).items()
-                              if (server or {}).get("enabled", True) is not False),
+    servers = sorted(name for name, server in (config.get("mcp_servers") or {}).items()
+                     if (server or {}).get("enabled", True) is not False)
+    return {"servers": servers, "local": sorted(set(servers) - set(user["config"].get("mcp_servers") or {})),
             # what's installed, and what the config names (the same plugin can appear under another marketplace)
             "plugins": sorted(set(installed) | set(config.get("plugins") or {})),
             "apps": [{"id": i, "name": n} for i, n in connectors.items()]}
@@ -114,11 +118,13 @@ def _toml(value) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def codex_flags(inventory: dict, names) -> list:
-    """app-server flags that switch off, for this process only, each of the user's tools runs may not use."""
-    if names == ALL:
-        return []
+def codex_flags(inventory: dict, names, sandboxed: bool = False) -> list:
+    """app-server flags that switch off, for this process only, each of the user's tools runs may not use (and for
+    a sandboxed run, the servers a repo's own config adds, which would run outside the sandbox)."""
     flags = []  # (Reset's own question tool is switched on after these, by worker.run_tools_config)
+    if names == ALL:
+        local = {s: {"enabled": False} for s in inventory.get("local") or []} if sandboxed else {}
+        return ["-c", "mcp_servers=" + _toml(local)] if local else []
     servers = {s: {"enabled": False} for s in inventory["servers"] if not matches(s, names)}
     if servers:
         flags += ["-c", "mcp_servers=" + _toml(servers)]
@@ -137,11 +143,11 @@ def codex_flags(inventory: dict, names) -> list:
 
 
 def codex_limits(executable: str, cfg: dict, cwd: str) -> list:
-    names = allowed(cfg)
-    if names == ALL:
+    names, sandboxed = allowed(cfg), cfg["runs"]["access"] != "full"
+    if names == ALL and not sandboxed:
         return []
     try:
-        return codex_flags(codex_inventory(executable, cwd), names)
+        return codex_flags(codex_inventory(executable, cwd), names, sandboxed)
     except Exception as exc:  # fail closed: a run that can't leave the user's tools out doesn't start
         raise ToolsError(f"Reset couldn't check which of your Codex tools this run would get ({exc}), so it didn't "
                          "start. Updating Codex usually fixes this; or let runs use all your tools.") from None
@@ -149,25 +155,34 @@ def codex_limits(executable: str, cfg: dict, cwd: str) -> list:
 
 # --- Claude --------------------------------------------------------------------------------------------------
 
+STRICT = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']  # no MCP servers at all
+
+
 def claude_args(cfg: dict, folder: str) -> list:
     """No tools allowed: Claude Code loads no MCP servers at all. Otherwise the user's load (the hook guards names),
-    but not the ones the run's folder defines, unless everything is allowed."""
+    but not the ones the run's folder defines, unless everything is allowed (sandboxed runs don't read the folder's
+    Claude settings at all: see worker.ClaudeEngine.args)."""
     names = allowed(cfg)
     if not names:
-        return ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
-    local = sorted(project_servers(folder))
-    return [] if names == ALL or not local else ["--settings", json.dumps({"disabledMcpjsonServers": local})]
+        return STRICT
+    local = project_servers(folder)
+    if local is None:  # a .mcp.json Reset can't read: none of the folder's servers can be told apart, so none load
+        return STRICT
+    return [] if names == ALL or not local else ["--settings", json.dumps({"disabledMcpjsonServers": sorted(local)})]
 
 
-def project_servers(folder: str) -> frozenset:
+def project_servers(folder: str):
     """The names of the MCP servers a run's folder (or a folder above it) defines in .mcp.json, read the way Claude
-    Code reads it (an odd byte doesn't stop it)."""
+    Code reads it (a byte-order mark or an odd byte doesn't stop it). None if a .mcp.json can't be read."""
     names = set()
     for place in [Path(folder), *Path(folder).parents]:
+        path = place / ".mcp.json"
         try:
-            data = json.loads((place / ".mcp.json").read_bytes().decode("utf-8", errors="replace"))
-        except (OSError, ValueError):
+            data = json.loads(path.read_bytes().decode("utf-8-sig", errors="replace"))
+        except FileNotFoundError:
             continue
+        except (OSError, ValueError):
+            return None
         servers = data.get("mcpServers") if isinstance(data, dict) else None
         names |= {name for name in servers or {} if isinstance(name, str)}
     return frozenset(names)
