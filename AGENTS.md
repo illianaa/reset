@@ -43,7 +43,8 @@ Ground rules:
 5. **Give runs full access (recommended):** `resetctl setup access --access full`
    - Tell the user what this means: approved runs can run commands, install packages and use the network without stopping to ask. Codex runs get no sandbox, and Claude Code runs use bypass-permissions mode.
    - Every run still needs their OK, has a token budget and a deadline, and can be stopped at once. Work on an existing codebase happens on a new branch in its own git worktree, never in their checkout.
-   - If they prefer, use `--access sandboxed`: runs can change files in their own folder, and anything else (the network, installs, git commits) is refused. Runs never wait for an answer either way; Reset texts the user when a run is refused something.
+   - If they prefer, use `--access sandboxed`: runs can change files in their own folder, and anything else (the network, installs, git commits) needs the user's OK. Reset texts them Allow and Deny buttons, and no answer within the wait (5 minutes by default) counts as no.
+   - Either way, runs don't get the user's connected tools (connectors like Gmail, Slack or GitHub, plugins, MCP servers) unless the user allows them, by asking their bot ("let runs use GitHub", or all of them).
    - If Claude runs fail because bypass-permissions mode is turned off (some organizations disable it), switch to sandboxed.
    - Runs show up as chats in the user's apps, to read and continue later like any chat they started.
      - Codex threads are named "Reset #N: …" and pinned in the Codex app.
@@ -91,6 +92,8 @@ Python 3.9+, standard library only (no dependencies), macOS and Linux.
 | `resetagent/models.py`, `workspace.py` | Live model and effort lists per engine; where a run works (scratch folder, new project, git worktree) and the brief the agent gets |
 | `resetagent/apps.py` | Runs as chats in the desktop apps: pinned Codex threads, live Claude runs over Remote Control, finished Claude runs handed to Claude Desktop, and the links that open a run's chat |
 | `resetagent/settings.py` | The settings users tune by chatting with the brain (a fixed list, each value checked), announced with an Undo button |
+| `resetagent/runtools.py` | Which of the user's connected tools runs may use: Codex runs get the rest switched off for their own process, Claude runs have them refused by Reset's hook |
+| `resetagent/asking.py` | Runs asking the user: questions and sandboxed permission requests go to the chat with buttons; answers come back from a tap, a reply, a typed command or the brain; the run waits a set time (its deadline paused), then decides without them |
 | `resetagent/providers/` | Reading usage: Codex app-server; Claude Code `get_usage`; Claude Desktop's cached reset grants |
 | `resetagent/monitor.py`, `notify.py`, `channels/` | Notification rules, durable outbox, Telegram (plus local and iMessage) delivery |
 | `resetagent/status.py`, `ideas.py`, `db.py`, `config.py` | Usage snapshots, the idea list, SQLite state in `~/.reset/`, settings |
@@ -102,10 +105,13 @@ Invariants. Keep these true in every change:
 3. **Only the user approves runs**, with a code, a Telegram button, or `resetctl approve` in a real terminal. Brains get `tools.py` and nothing more: no approve or redeem tools.
    - The settings a brain can change are a fixed list in `settings.py`, and each value is checked.
    - Reset announces every change a brain makes in its own message, with an Undo button, so no setting changes without the user seeing it.
+   - A brain can't give runs more access (more of the user's tools, or full access): Reset asks the user, and only their tap (or `confirm <code>`) makes that change.
+   - A brain can pass the user's answer on to a run's question (`answer_question`), and Reset announces what it sent. Permission requests from sandboxed runs are the user's alone: only their own tap, reply or typed `allow`/`deny` answers them.
 4. **Reset redemption is manual.** The Codex client blocks the redeem method (`FORBIDDEN` in `providers/codex.py`).
 5. **Stopping is enforced, not requested.** The supervisor kills every process a run was seen to spawn, identified by pid and start time, and verifies that none survived. After a restart, runs default to stopped.
 6. **The conversation is provider-neutral.** It's stored as plain text, and brain calls are stateless, so any model can answer the next message.
 7. **Unknown stays unknown.** Missing percentages or expiries are `None`, never 0. Cached data never authorizes a run.
+8. **Runs use only the connected tools the user allowed** (`runs.tools`: none by default). Enforcement fails closed: a Claude run's hook refuses any MCP tool or resource not on the list (and any server the run's folder defines, unless all are allowed), and a Codex run whose tools can't be checked doesn't start. With full access a run can still start other programs as the user, so this guards against mistakes; sandboxed access is the hard boundary.
 
 Settings: `~/.reset/config.json`, written by `resetctl setup`, and by `settings.py` and the `floor` command when the user tunes Reset by chatting. Optional environment overrides are listed in `.env.example` and registered in `config.ENV_VARS`. Read them only through `config.env()`, which rejects unregistered names. Never commit secrets or personal data: `.env`, `~/.reset` and local notes are git-ignored.
 

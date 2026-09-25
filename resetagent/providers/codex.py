@@ -50,11 +50,11 @@ class AppServer:
 
     ALLOWED = READ_METHODS
 
-    def __init__(self, executable: str, allowed=None, cwd: str | None = None):
+    def __init__(self, executable: str, allowed=None, cwd: str | None = None, extra_args=()):
         if allowed is not None:
             self.ALLOWED = frozenset(allowed) - FORBIDDEN
         self.process = subprocess.Popen(
-            [executable, "app-server", "--stdio"], stdin=subprocess.PIPE,
+            [executable, "app-server", "--stdio", *extra_args], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, cwd=cwd)
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.process.stdout, selectors.EVENT_READ)

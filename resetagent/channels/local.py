@@ -23,7 +23,7 @@ class Local:
     def configured(self) -> bool:
         return bool(self.settings.get("enabled", True))
 
-    def send(self, text: str, buttons=None) -> None:
+    def send(self, text: str, buttons=None, verbatim: bool = False) -> None:
         logs = config.home() / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         with open(logs / "notifications.log", "a") as handle:

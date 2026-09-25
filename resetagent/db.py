@@ -149,6 +149,22 @@ CREATE TABLE IF NOT EXISTS brain_tasks (
     brain TEXT,
     result TEXT
 );
+
+-- A run asking the user something (a question, or permission for an action) and waiting for the answer.
+CREATE TABLE IF NOT EXISTS questions (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,                      -- question | permission
+    nonce TEXT NOT NULL,                     -- binds button taps to this question
+    body TEXT NOT NULL,                      -- JSON: what was asked, with its options
+    status TEXT NOT NULL DEFAULT 'waiting',  -- waiting | answered | expired | closed
+    answer TEXT,                             -- JSON
+    answered_via TEXT,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    answered_at REAL
+);
+CREATE INDEX IF NOT EXISTS questions_by_run ON questions(run_id, status);
 """
 
 # Columns added after the first release; connect() adds any that an older database lacks, then runs the
@@ -168,6 +184,8 @@ ADDED_COLUMNS = [
     # Claude runs: handed to Claude Desktop ("done") or why not. Runs from before stay out of the apps.
     ("runs", "handoff", "TEXT", "UPDATE runs SET handoff = 'not-shown'"),
     ("runs", "handed_off_at", "REAL"),
+    ("runs", "latest_end", "REAL"),  # the latest a run may end (before a usage limit resets), however long it waits
+    ("notifications", "message_ref", "TEXT"),  # the channel's id for the sent message (a Telegram message_id)
 ]
 
 

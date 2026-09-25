@@ -90,7 +90,7 @@ class IMessage:
     def configured(self) -> bool:
         return bool(self.settings.get("enabled") and (self.settings.get("chatGuid") or self.settings.get("handle")))
 
-    def send(self, text: str, buttons=None) -> None:
+    def send(self, text: str, buttons=None, verbatim: bool = False) -> None:
         body = f"{MARKER} {text}"
         guid = self.settings.get("chatGuid")
         script, target = (SEND_TO_CHAT, guid) if guid else (SEND_TO_HANDLE, self.settings.get("handle"))

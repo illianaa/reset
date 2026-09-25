@@ -738,6 +738,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("worker")  # internal: started by the supervisor for each approved run
     p.add_argument("run_id", type=int)
     p.set_defaults(fn=cmd_worker)
+
+    p = sub.add_parser("ask-server")  # internal: a Codex run's ask_user tool over MCP, started by its Codex
+    p.add_argument("run_id", type=int)
+    p.set_defaults(fn=cmd_ask_server)
     return parser
 
 
@@ -745,6 +749,12 @@ def cmd_worker(args) -> int:
     from resetagent import worker
 
     return worker.main(args.run_id)
+
+
+def cmd_ask_server(args) -> int:
+    from resetagent import asking
+
+    return asking.serve_run(args.run_id)
 
 
 def main(argv=None) -> int:

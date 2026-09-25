@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-from resetagent import apps, brain, config, db, ideas, notify, runs, settings, status
+from resetagent import apps, asking, brain, config, db, ideas, notify, runs, settings, status
 from resetagent.providers.common import describe
 from resetagent.timeutil import local, now, span
 
@@ -20,7 +20,8 @@ HELP = ("Reset commands:\n"
         "yes <code> / no <code> · answer a request\n"
         "runs · what's running · stop <#> · stop one run · stop · stop everything\n"
         "open <run#> · open a run's chat in the Codex or Claude app on your Mac\n"
-        "floor <n>% · the share of each usage limit runs leave alone")
+        "floor <n>% · the share of each usage limit runs leave alone\n"
+        "answer <#> <choice> · answer a run's question (or reply to it) · allow <#> / deny <#> · a run's request")
 
 
 @dataclass
@@ -43,8 +44,11 @@ PATTERNS = [
     (re.compile(r"^stop(?:\s+(?:run\s+)?#?(\d+|all))?[.!]?$", re.I), "stop"),
     (re.compile(r"^(?:runs|jobs)\??$", re.I), "runs"),
     (re.compile(r"^(?:open|show)\s+(?:run\s+)?#?(\d+)(?:\s+in\s+(?:the\s+)?(?:codex|claude|app))?[.!]?$", re.I), "open"),
+    (re.compile(r"^confirm\s+([0-9a-f]{8})$", re.I), "confirm"),  # more access for runs, which the AI asked for
+    (re.compile(r"^keep\s+([0-9a-f]{8})$", re.I), "keep"),  # (before "keep 8", the floor)
     (re.compile(r"^(?:floor|keep)(?:\s+(?:at\s+)?(\d+)\s*%?)?[.!?]?$", re.I), "floor"),
     (re.compile(r"^undo\s+([0-9a-f]{8})$", re.I), "undo"),
+    (re.compile(r"^(allow|deny)\s+#?(\d+)[.!]?$", re.I), "permit"),
     (re.compile(r"^(?:drop|remove|delete)\s+(?:idea\s+)?#?(\d+)$", re.I), "drop"),
     (re.compile(r"^(?:ok|buzzed|got it)\s+(\d{4})$", re.I), "delivery-buzz"),
     (re.compile(r"^(?:quiet|silent)\s+(\d{4})$", re.I), "delivery-silent"),
@@ -69,6 +73,10 @@ def parse(text: str) -> Command:
             return Command("help")
         body = f"{slash.group(1)} {slash.group(2) or ''}".strip()
     body = re.sub(r"^@?reset\b[\s,:]*", "", body, flags=re.I) or "help"
+    # "answer 12 2", "answer 12 decide", "answer 12: in the user's own words" (case kept)
+    answered = re.fullmatch(r"answer\s+#?(\d+)(?:\s*[:\-–—]\s*|\s+)(.+)", body, re.I | re.S)
+    if answered:
+        return Command("answer", answered.group(1), answered.group(2).strip())
     run = RUN.fullmatch(body)
     if run:
         idea, engine, model, effort = run.groups()
@@ -163,6 +171,17 @@ def handle(conn, cfg: dict, row, command: Command) -> str | None:
         return apps.open_run(conn, run) if run else f"No run #{command.arg}."
     if kind == "floor":
         return floor(cfg, command.arg)
+    if kind == "answer":  # a run's question or permission request: a tap, a reply, or typed
+        return asking.answer(conn, int(command.arg), command.extra, via=channel)
+    if kind == "permit":  # "allow 13" / "deny 13"; parse() gives the number as extra
+        asked = asking.get(conn, int(command.extra))
+        if asked is None or asked["kind"] != "permission":
+            return (f"There's no permission request #{command.extra}." if asked is None else
+                    f"#{command.extra} is a question, not a permission request. Reply to it, or send “answer "
+                    f"{command.extra} …”.")
+        return asking.answer(conn, asked["id"], command.arg.lower(), via=channel)
+    if kind in ("confirm", "keep"):  # the user's answer to more access for runs, which Reset's AI asked for
+        return settings.confirm(conn, command.arg.lower(), yes=kind == "confirm")
     if kind == "undo":  # the Undo button under a change Reset's AI made
         return settings.undo(conn, command.arg.lower())
     if kind == "drop":

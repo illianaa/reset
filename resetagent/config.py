@@ -128,6 +128,8 @@ DEFAULTS = {
         "showInApps": True,
         "effort": "high",
         "maxRunsPerEngine": 3,  # runs working at once on each subscription (Codex, Claude)
+        "questionWaitMinutes": 5,  # how long a run waits for the user's answer to its question (0: never asks)
+        "tools": [],  # the user's connectors, plugins and MCP servers runs may use: "all", or names (runtools.py)
         "budgetTokens": 150000,
         "maxMinutes": 20,
         "askMinutes": 30,

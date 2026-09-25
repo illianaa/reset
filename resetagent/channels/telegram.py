@@ -23,6 +23,12 @@ COMMANDS = [("status", "Usage limits and one-time resets"), ("ideas", "Your idea
 CALLBACK = re.compile(r"ask:(\d+):([0-9a-f]{8}):([ynx])")
 OPEN = re.compile(r"run:(\d+):open")  # "Open in Codex/Claude" under a finished run
 UNDO = re.compile(r"undo:([0-9a-f]{8})")  # "Undo" under a setting Reset's AI changed
+ANSWER = re.compile(r"qa:(\d+):([0-9a-f]{8}):(y|n|d|\d+\.\d+)")  # a tap on a run's question or permission request
+CHOICES = {"y": "allow", "n": "deny", "d": "decide"}
+SETTING = re.compile(r"set(ok|no):([0-9a-f]{8})")  # Allow / Keep it as is, under more access the AI asked for
+# A reply to a run's question answers it, unless it's a command that acts by itself.
+KEEP = {"stop", "approve", "decline", "switch", "answer", "permit", "undo", "confirm", "status", "runs", "ideas",
+        "help"}
 TAPS = {"y": ("yes", "Starting…"), "n": ("no", "Skipped."), "x": ("switch", "Switching…")}
 
 
@@ -31,6 +37,12 @@ def plain(text: str) -> str:
     text = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda m: m.group(1) or m.group(2), text)
     text = re.sub(r"`([^`\n]+)`", r"\1", text)
     return re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+
+
+def ref(token: str, chat_id, message_id) -> str:
+    """A sent message, told apart from other bots' (message ids start over with each bot, and a private chat's id is
+    the user's, whichever bot it is)."""
+    return f"{str(token).split(':')[0]}:{chat_id}:{message_id}"
 
 
 def chunks(text: str, size: int = LIMIT) -> list:
@@ -76,14 +88,20 @@ class Telegram:
             raise ChannelError(f"Telegram: {str(data.get('description') or 'request failed')[:160]}")
         return data.get("result")
 
-    def send(self, text: str, buttons=None) -> None:
-        parts = chunks(plain(text))
+    last_ref = None  # the last message sent, as "chat:message" for each of its parts (a reply can quote any)
+
+    def send(self, text: str, buttons=None, verbatim: bool = False) -> None:
+        parts, refs = chunks(text if verbatim else plain(text)), []
+        self.last_ref = None
         for index, part in enumerate(parts):
             payload = {"chat_id": self.settings["chatId"], "text": part, "disable_web_page_preview": True}
             if buttons and index == len(parts) - 1:
                 payload["reply_markup"] = {"inline_keyboard": [
                     [{"text": b["text"], "callback_data": b["data"]} for b in row] for row in buttons]}
-            self.call("sendMessage", payload)
+            sent = self.call("sendMessage", payload)
+            if isinstance(sent, dict) and "message_id" in sent:
+                refs.append(ref(self.settings["botToken"], self.settings["chatId"], sent["message_id"]))
+        self.last_ref = ",".join(refs) or None
 
     def typing(self) -> None:
         try:
@@ -128,8 +146,26 @@ class Telegram:
             return 0
         if not self.owner(chat.get("id"), sender.get("id")) or not text.strip():
             return 0
+        # A reply to a run's question message answers it, in the user's own words. (The newest message with that
+        # id: a new bot starts its message ids over.)
+        replied = (message.get("reply_to_message") or {}).get("message_id")
+        sent = replied is not None and conn.execute(
+            "SELECT dedupe_key FROM notifications WHERE sent_via = ? AND (',' || message_ref || ',') LIKE ? "
+            "ORDER BY id DESC LIMIT 1",
+            (self.name, f"%,{ref(self.settings.get('botToken'), chat.get('id'), replied)},%")).fetchone()
+        asked = sent and re.fullmatch(r"question:(\d+)", sent["dedupe_key"] or "")
+        if asked and not self.acts(text):
+            text = f"answer {asked.group(1)}: {text.strip()}"
         return int(persist_inbound(conn, self.name, str(update["update_id"]), str(sender.get("id")),
                                    text.strip(), message.get("date")))
+
+    @staticmethod
+    def acts(text: str) -> bool:
+        """A command that does its own thing even as a reply: stop, an approval with its code, "/…", "idea …"."""
+        from resetagent import commands  # (commands reaches the channels through notify)
+
+        body = text.strip()
+        return body.startswith("/") or bool(re.match(r"idea\b", body, re.I)) or commands.parse(body).kind in KEEP
 
     def callback(self, conn, query: dict) -> int:
         """A tap on Start/Skip becomes the equivalent typed command, so it goes through the same checks."""
@@ -138,7 +174,23 @@ class Telegram:
         saved, reply = 0, "Only the paired account can do that."
         opening = OPEN.fullmatch(query.get("data") or "")
         undoing = UNDO.fullmatch(query.get("data") or "")
-        if opening and self.owner(chat_id, (query.get("from") or {}).get("id")):
+        answering = ANSWER.fullmatch(query.get("data") or "")
+        setting = SETTING.fullmatch(query.get("data") or "")
+        if setting and self.owner(chat_id, (query.get("from") or {}).get("id")):
+            verb = "confirm" if setting.group(1) == "ok" else "keep"
+            saved = int(persist_inbound(conn, self.name, f"cb:{query['id']}", str(query["from"]["id"]),
+                                        f"{verb} {setting.group(2)}", now()))
+            reply = "Changing it…" if verb == "confirm" else "Keeping it as is…"
+        elif answering and self.owner(chat_id, (query.get("from") or {}).get("id")):
+            asked = conn.execute("SELECT status FROM questions WHERE id = ? AND nonce = ?",
+                                 (int(answering.group(1)), answering.group(2))).fetchone()
+            reply = "That question is no longer open."
+            if asked and asked["status"] == "waiting":
+                choice = CHOICES.get(answering.group(3), answering.group(3))
+                saved = int(persist_inbound(conn, self.name, f"cb:{query['id']}", str(query["from"]["id"]),
+                                            f"answer {answering.group(1)} {choice}", now()))
+                reply = "Sending…"
+        elif opening and self.owner(chat_id, (query.get("from") or {}).get("id")):
             saved = int(persist_inbound(conn, self.name, f"cb:{query['id']}", str(query["from"]["id"]),
                                         f"open {opening.group(1)}", now()))
             reply = "Opening it on your Mac…"

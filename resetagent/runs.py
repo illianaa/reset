@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 
-from resetagent import apps, config, db, ideas, models, notify, proctree, status, workspace
+from resetagent import apps, asking, config, db, ideas, models, notify, proctree, status, workspace
 from resetagent.providers.common import describe
 from resetagent.timeutil import iso, local, now, span
 
@@ -360,11 +360,13 @@ def approve(conn, cfg: dict, code: str, via: str, at: float | None = None):
                 raise RunError(f"Idea #{idea['id']} is no longer open.")
             run_id = conn.execute(
                 "INSERT INTO runs(ask_id, idea_id, engine, workdir, budget_tokens, deadline_at, effort, status, "
-                "created_at, model, project, workspace, branch) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?)",
+                "created_at, model, project, workspace, branch, latest_end) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?)",
                 (ask["id"], idea["id"], ask["engine"], str(prepared["workdir"]), ask["budget_tokens"], deadline,
                  ask["effort"], at, ask["model"], str(prepared["project"]) if prepared["project"] else None,
-                 prepared["kind"], prepared["branch"])).lastrowid
+                 prepared["kind"], prepared["branch"],
+                 # time spent waiting for the user can push the deadline back, but never past this
+                 earliest - cfg["runs"]["resetMarginMinutes"] * 60 if earliest else None)).lastrowid
             conn.execute("UPDATE asks SET run_id = ? WHERE id = ?", (run_id, ask["id"]))
     except BaseException:
         workspace.discard(prepared)  # nothing is left behind for a run that didn't start
@@ -451,6 +453,7 @@ def finalize(conn, run_id: int, survivors: list, tracked: int, default_outcome: 
              error: str | None = None) -> dict:
     at = now()
     cleanup = {"verifiedAt": iso(at), "processesTracked": tracked, "survivors": survivors}
+    asking.close_for_run(conn, run_id)
     conn.execute("UPDATE runs SET status = 'done', outcome = COALESCE(outcome, ?), error = COALESCE(error, ?), "
                  "ended_at = COALESCE(ended_at, ?), verified_at = ?, cleanup = ? WHERE id = ?",
                  (default_outcome, error, at, at, json.dumps(cleanup), run_id))
@@ -599,6 +602,13 @@ def summary_text(conn, at: float | None = None) -> str:
         lines.append(f"Run #{run['id']} ({engine_name(run['engine'])}, idea #{run['idea_id']}) {run['status']} · "
                      f"{span(at - started)} · {run['tokens_used'] / 1000:.1f}k of {run['budget_tokens'] / 1000:g}k "
                      f"tokens · stops by {local(run['deadline_at'], at)}")
+        for question in asking.waiting(conn, run["id"]):
+            lines.append(f"  waiting for your answer to {question['kind']} #{question['id']} until "
+                         f"{local(question['expires_at'], at)} (reply to it, or send “answer {question['id']} …”)"
+                         if question["kind"] == "question" else
+                         f"  waiting for you to allow or deny permission #{question['id']} until "
+                         f"{local(question['expires_at'], at)} (“allow {question['id']}” or "
+                         f"“deny {question['id']}”)")
     for ask in conn.execute("SELECT * FROM asks WHERE status = 'pending' ORDER BY id").fetchall():
         lines.append(f"Request {ask['code']}: idea #{ask['idea_id']} with {engine_name(ask['engine'])}, "
                      f"expires {local(ask['expires_at'], at)}")
