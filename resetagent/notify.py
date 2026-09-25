@@ -8,6 +8,7 @@ from resetagent.channels.base import ChannelError
 from resetagent.timeutil import now
 
 MAX_ATTEMPTS = 8
+VERBATIM = {"question"}  # messages quoting what a run wrote (a command it wants to run) are sent exactly as is
 
 
 def enqueue(conn, kind: str, text: str, dedupe_key: str | None = None, channel: str | None = None,
@@ -38,13 +39,15 @@ def flush(conn, cfg: dict, built: dict | None = None, at: float | None = None) -
             continue
         try:
             via = channels.deliver(conn, cfg, row["text"], preferred=row["channel"], built=built,
-                                   buttons=json.loads(row["buttons"]) if row["buttons"] else None)
+                                   buttons=json.loads(row["buttons"]) if row["buttons"] else None,
+                                   verbatim=row["kind"] in VERBATIM)
         except ChannelError as exc:
             conn.execute("UPDATE notifications SET attempts = attempts + 1, last_attempt_at = ?, "
                          "last_error = ? WHERE id = ?", (at, str(exc)[:300], row["id"]))
             results.append((row["id"], None, str(exc)))
             continue
         conn.execute("UPDATE notifications SET attempts = attempts + 1, last_attempt_at = ?, sent_at = ?, "
-                     "sent_via = ? WHERE id = ?", (at, at, via, row["id"]))
+                     "sent_via = ?, message_ref = ? WHERE id = ?",
+                     (at, at, via, getattr(built[via], "last_ref", None), row["id"]))
         results.append((row["id"], via, None))
     return results

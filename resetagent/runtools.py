@@ -7,8 +7,13 @@ claude.ai's "Google Drive" connector and "github" is Codex's GitHub connector an
 Codex runs: just before the run's own app-server starts, a short-lived one reports the user's connectors, plugins and
 MCP servers (no model is involved). Every one that isn't allowed is switched off for the run's Codex process only,
 with -c overrides; the user's config isn't touched, so a run's chat continued in the Codex app has everything again.
-Claude runs: with no tools allowed, Claude Code loads no MCP servers at all. With names, it loads the user's servers
-and connectors, and Reset's hook refuses any MCP tool that isn't allowed, so an unknown one is refused too.
+Claude runs: with no tools allowed, Claude Code loads no MCP servers at all. Otherwise it loads the user's servers and
+connectors, and Reset's hook refuses any MCP tool (or MCP resource) that isn't allowed, reading the setting at each
+call, so an unknown one is refused too, and a narrower setting reaches runs already going. A server the run's own
+folder defines (.mcp.json) is refused unless everything is allowed, so a repo can't pass one off as an allowed name.
+
+This keeps a run's tools to what the user chose. A run with full access can still start other programs as the user,
+so it guards against mistakes, not against a run set on getting around it: sandboxed access is the hard boundary.
 """
 from __future__ import annotations
 
@@ -22,9 +27,11 @@ from resetagent.providers import codex
 
 ALL = "all"
 SCOUT_METHODS = frozenset({"initialize", "config/read", "plugin/installed", "app/installed"})
-# Claude Code asks Reset about every MCP tool call (a hook it registers when the session starts).
+# Claude Code asks Reset about every MCP tool call (a hook it registers when the session starts). Its resource
+# tools reach any server by name, so they're asked about too.
+RESOURCE_TOOLS = ("ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool")
 CLAUDE_HOOK_ID = "reset-run-tools"
-CLAUDE_HOOKS = {"PreToolUse": [{"matcher": "mcp__.*", "hookCallbackIds": [CLAUDE_HOOK_ID]}]}
+CLAUDE_HOOKS = {"PreToolUse": [{"matcher": "mcp__.*|" + "|".join(RESOURCE_TOOLS), "hookCallbackIds": [CLAUDE_HOOK_ID]}]}
 CLAUDE_CONNECTOR = "claude.ai "  # how Claude Code names the user's claude.ai connectors
 
 
@@ -75,35 +82,43 @@ def codex_inventory(executable: str, cwd: str | None = None) -> dict:
     client = codex.AppServer(executable, allowed=SCOUT_METHODS, cwd=cwd)
     try:
         codex.initialize(client, "reset_tools")
-        config = (client.call("config/read", {"cwd": cwd} if cwd else {}, timeout=20) or {}).get("config") or {}
-        plugins = client.call("plugin/installed", {}, timeout=20) or {}
-        apps = client.call("app/installed", {}, timeout=20) or {}
+        read = client.call("config/read", {"cwd": cwd} if cwd else {}, timeout=20)
+        plugins = client.call("plugin/installed", {}, timeout=20)
+        apps = client.call("app/installed", {}, timeout=20)
     finally:
         client.close()
+    if not isinstance((read or {}).get("config"), dict) or not isinstance(plugins, dict) or not isinstance(apps, dict):
+        raise ToolsError("Codex didn't report its tools")  # (so nothing is left on by mistake)
+    config = read["config"]
     installed = [f"{p['name']}@{m['name']}" for m in plugins.get("marketplaces") or [] for p in m.get("plugins") or []
                  if p.get("name") and p.get("installed", True)]
+    connectors = {a["id"]: a.get("runtimeName") or a["id"] for a in apps.get("apps") or [] if a.get("id")}
+    for app in config.get("apps") or {}:  # a connector the config names is on unless switched off, even if unlisted
+        if app != "_default":
+            connectors.setdefault(app, app)
     return {"servers": sorted(name for name, server in (config.get("mcp_servers") or {}).items()
                               if (server or {}).get("enabled", True) is not False),
             # what's installed, and what the config names (the same plugin can appear under another marketplace)
             "plugins": sorted(set(installed) | set(config.get("plugins") or {})),
-            "apps": [{"id": a["id"], "name": a.get("runtimeName") or a["id"]} for a in apps.get("apps") or []
-                     if a.get("id")]}
+            "apps": [{"id": i, "name": n} for i, n in connectors.items()]}
 
 
 def _toml(value) -> str:
+    """A TOML value for a -c override. JSON strings are TOML strings, once non-ASCII is left as it is (JSON would
+    escape an emoji as two halves, which TOML rejects)."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, dict):
-        return "{" + ", ".join(f"{json.dumps(k)}={_toml(v)}" for k, v in value.items()) + "}"
-    return json.dumps(value)
+        return "{" + ", ".join(f"{json.dumps(k, ensure_ascii=False)}={_toml(v)}" for k, v in value.items()) + "}"
+    return json.dumps(value, ensure_ascii=False)
 
 
 def codex_flags(inventory: dict, names) -> list:
     """app-server flags that switch off, for this process only, each of the user's tools runs may not use."""
     if names == ALL:
         return []
-    flags = []
-    servers = {s: {"enabled": False} for s in inventory["servers"] if s != "reset" and not matches(s, names)}
+    flags = []  # (Reset's own question tool is switched on after these, by worker.run_tools_config)
+    servers = {s: {"enabled": False} for s in inventory["servers"] if not matches(s, names)}
     if servers:
         flags += ["-c", "mcp_servers=" + _toml(servers)]
     plugins = [p for p in inventory["plugins"] if not matches(p.split("@")[0], names)]
@@ -111,9 +126,10 @@ def codex_flags(inventory: dict, names) -> list:
         flags += ["--disable", "plugins"]
     elif plugins:  # (quoted keys like "github@openai-curated" only work in an inline table)
         flags += ["-c", "plugins=" + _toml({p: {"enabled": False} for p in plugins})]
-    apps = [a["id"] for a in inventory["apps"] if matches(a["name"], names)]
-    if apps:
-        flags += ["-c", "apps=" + _toml({"_default": {"enabled": False}, **{a: {"enabled": True} for a in apps}})]
+    apps = {a["id"]: matches(a["name"], names) for a in inventory["apps"]}
+    if any(apps.values()):  # each one named, since a config entry for a connector would switch it back on
+        flags += ["-c", "apps=" + _toml({"_default": {"enabled": False},
+                                         **{a: {"enabled": on} for a, on in apps.items()}})]
     else:
         flags += ["--disable", "apps"]
     return flags
@@ -137,8 +153,16 @@ def claude_args(cfg: dict) -> list:
     return [] if allowed(cfg) else ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
 
 
-def claude_hooks(cfg: dict):
-    return None if allowed(cfg) == ALL else CLAUDE_HOOKS
+def project_servers(folder: str) -> frozenset:
+    """Normalized names of the MCP servers a run's folder (or a folder above it) defines in .mcp.json."""
+    names = set()
+    for place in [Path(folder), *Path(folder).parents]:
+        try:
+            servers = json.loads((place / ".mcp.json").read_text()).get("mcpServers") or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        names |= {normalize(name) for name in servers if isinstance(name, str)}
+    return frozenset(names)
 
 
 def claude_server(tool_name: str) -> str:
@@ -147,14 +171,24 @@ def claude_server(tool_name: str) -> str:
     return parts[1] if len(parts) >= 3 and parts[0] == "mcp" else ""
 
 
-def claude_decision(names, tool_name: str) -> dict:
-    """Reset's answer to Claude Code's hook: nothing to say (the call goes ahead as usual), or a refusal."""
-    if not str(tool_name).startswith("mcp__") or matches(claude_server(tool_name), names):
+REFUSED = {"hookSpecificOutput": {
+    "hookEventName": "PreToolUse", "permissionDecision": "deny",
+    "permissionDecisionReason": "The user hasn't allowed Reset runs to use this tool. Do without it, and mention it in "
+                                "your final summary."}}
+
+
+def claude_decision(names, tool_name: str, tool_input=None, local=frozenset()) -> dict:
+    """Reset's answer to Claude Code's hook: nothing to say (the call goes ahead as usual), or a refusal.
+    local: servers the run's own folder defines, refused unless everything is allowed."""
+    if tool_name in RESOURCE_TOOLS:
+        server = str((tool_input or {}).get("server") or "")  # none: every server's resources
+    elif str(tool_name).startswith("mcp__"):
+        server = claude_server(tool_name)
+    else:
+        return {}  # the run's built-in tools aren't the user's to limit here
+    if names == ALL or (server and matches(server, names) and normalize(server) not in local):
         return {}
-    return {"hookSpecificOutput": {
-        "hookEventName": "PreToolUse", "permissionDecision": "deny",
-        "permissionDecisionReason": "The user hasn't allowed Reset runs to use this tool. Do without it, and "
-                                    "mention it in your final summary."}}
+    return REFUSED
 
 
 def claude_inventory(executable: str) -> list:

@@ -185,6 +185,7 @@ ADDED_COLUMNS = [
     ("runs", "handoff", "TEXT", "UPDATE runs SET handoff = 'not-shown'"),
     ("runs", "handed_off_at", "REAL"),
     ("runs", "latest_end", "REAL"),  # the latest a run may end (before a usage limit resets), however long it waits
+    ("notifications", "message_ref", "TEXT"),  # the channel's id for the sent message (a Telegram message_id)
 ]
 
 

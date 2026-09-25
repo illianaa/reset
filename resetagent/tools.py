@@ -1,8 +1,10 @@
 """Reset's tools for AI brains. One implementation, reached over MCP by Claude Code and Codex.
 
 Brains can read everything and take a few safe actions (save/remove ideas, request a run, stop).
-They can change only the settings listed in settings.py, and Reset announces each change with an Undo button.
-They cannot approve runs or redeem resets: those stay with the user.
+They can change only the settings listed in settings.py, and Reset announces each change with an Undo button;
+giving runs more access (tools, full access) waits for the user's tap. They can pass the user's answers on to a run's
+questions (announced), never its permission requests. They cannot approve runs or redeem resets: those stay with the
+user.
 """
 from __future__ import annotations
 
@@ -204,6 +206,10 @@ def change_setting(conn, setting: str, value: str) -> dict:
         old, new = settings.change(conn, setting, value, by_ai=True)
     except settings.SettingError as exc:
         return {"changed": False, "reason": str(exc)}
+    except settings.AskedUser:
+        return {"changed": False, "askedUser": True,
+                "note": "This gives runs more access, so it's the user's call: Reset sent them Allow and Keep it as "
+                        "is buttons. Tell them to tap one."}
     return {"changed": old != new, "setting": setting, "from": settings.show(setting, old),
             "to": settings.show(setting, new),
             "note": "Reset sent the user its own message about this change, with an Undo button."}

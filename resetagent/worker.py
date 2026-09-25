@@ -30,40 +30,47 @@ SANDBOX_BLOCK = re.compile(r"operation not permitted|read-only file system|could
                            r"unreachable|name resolution|nodename nor servname|ENOTFOUND|EAI_AGAIN", re.IGNORECASE)
 # What a command's output looks like when a tool or service wants the user signed in.
 SIGN_IN = re.compile(r"not (?:logged|signed) in|please (?:log|sign) ?in|(?:log|sign)[ -]?in required|authentication "
-                     r"(?:is )?required|requires authentication|unauthenticated|no (?:valid )?credentials|missing "
-                     r"credentials|could not find credentials|run:?\s+[`'\"]?[\w.-]+ (?:auth )?login", re.IGNORECASE)
+                     r"(?:is )?required|requires authentication|run:?\s+[`'\"]?[\w.-]+ (?:auth )?login", re.IGNORECASE)
 # Where the output names the command that signs in ("Run `vercel login`", "try gh auth login").
 LOGIN_HINT = re.compile(r"\b(?:run|try|use):?\s+[`'\"]?((?:[\w.-]+ )?[\w.-]+ (?:auth )?login)\b", re.IGNORECASE)
-LAUNCHERS = {"npx", "bunx", "pnpx", "uvx", "sudo", "env", "command", "exec"}  # the tool is the word after these
+LAUNCHERS = {"npx", "bunx", "pnpx", "uvx", "sudo", "env", "command", "exec", "cd"}  # the tool comes after these
 APPROVALS = ("item/commandExecution/requestApproval", "execCommandApproval", "item/fileChange/requestApproval",
              "applyPatchApproval", "item/permissions/requestApproval")
 
 
 def run_tools_config(run_id: int) -> list:
-    """Codex config overrides that give a run Reset's ask_user tool: a small MCP server of its own. The tool
-    call may take as long as the longest wait, so a wait changed mid-run never cuts a question short."""
-    env = "{" + ", ".join(f"{key} = {json.dumps(value)}" for key, value in
+    """Codex config overrides that give a run Reset's ask_user tool: a small MCP server of its own, started from
+    Reset's folder (never the run's copy of anything) and allowed without asking. The tool call may take as long
+    as the longest wait, so a wait changed mid-run never cuts a question short."""
+    def toml(value):
+        return json.dumps(value, ensure_ascii=False)
+
+    env = "{" + ", ".join(f"{key} = {toml(value)}" for key, value in
                           (("RESET_HOME", str(config.home())), ("PYTHONPATH", str(ROOT)))) + "}"
-    return ["-c", f"mcp_servers.reset.command={json.dumps(sys.executable)}",
-            "-c", f"mcp_servers.reset.args={json.dumps(['-m', 'resetagent', 'ask-server', str(run_id)])}",
-            "-c", f"mcp_servers.reset.env={env}",
-            "-c", f"mcp_servers.reset.tool_timeout_sec={asking.MAX_WAIT_MINUTES * 60 + 120}",
-            "-c", "mcp_servers.reset.startup_timeout_sec=30"]
+    server = f"mcp_servers.{asking.RUN_SERVER}"
+    return ["-c", f"{server}.command={toml(sys.executable)}",
+            "-c", f"{server}.args={toml(['-m', 'resetagent', 'ask-server', str(run_id)])}",
+            "-c", f"{server}.cwd={toml(str(ROOT))}",
+            "-c", f"{server}.env={env}",
+            "-c", f"{server}.enabled=true",
+            "-c", f'{server}.default_tools_approval_mode="approve"',
+            "-c", f"{server}.tool_timeout_sec={asking.MAX_WAIT_MINUTES * 60 + 120}",
+            "-c", f"{server}.startup_timeout_sec=30"]
 
 
-def shown(command) -> str:
+def clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def shown(command, limit: int = 200) -> str:
     """A command as the agent wrote it, without the shell wrapper Codex adds (`/bin/zsh -lc '…'`)."""
     command = " ".join(command) if isinstance(command, list) else str(command or "a command")
     match = re.fullmatch(r"\S*?(?:ba|z)?sh -l?c (['\"])(.*)\1", command.strip(), re.S)
-    return (match.group(2) if match else command)[:200]
+    return clip(match.group(2) if match else command, limit)
 
 
 def task_for(idea) -> str:
     return f"Idea #{idea['id']} from my Reset idea list:\n\n{idea['text']}"
-
-
-UNATTENDED_ANSWER = ("Nobody can answer right now. Make the most reasonable choice yourself, keep going, and mention "
-                     "the choice in your final summary.")
 
 
 def access_hint(cfg: dict) -> str:
@@ -120,18 +127,20 @@ class Engine:
         """Give the run the answer to its question: the question's row, or None when runs don't wait."""
 
     def sign_in(self, command: str, output: str) -> None:
-        """A command failed because a tool or service wants the user signed in: tell them, once per tool."""
-        words = [w.rsplit("/", 1)[-1] for w in command.split()]
+        """A command failed because a tool or service wants the user signed in: tell them, once per tool. The tool
+        is the one the output says to sign in with, or else the last command of the line."""
+        hint = LOGIN_HINT.search(output)
+        line = hint.group(1) if hint else re.split(r"&&|\|\||;|\|", command)[-1]
+        words = [w.rsplit("/", 1)[-1] for w in line.split() if not re.match(r"\w+=", w)]  # (not VAR=value)
         while len(words) > 1 and words[0] in LAUNCHERS:
             words.pop(0)
         tool = words[0] if words else "a tool"
         if f"sign-in:{tool}" in self.reported:
             return
         self.reported.add(f"sign-in:{tool}")
-        hint = LOGIN_HINT.search(output)
-        self.alerts.append(f"{self.who()} hit a sign-in wall running `{command[:120]}`: {tool} wants you signed in. "
-                           + (f"Sign in on your Mac (it suggests `{hint.group(1)}`)" if hint else "Sign in to it on "
-                              "your Mac") + ", so later runs can use it.")
+        self.alerts.append(f"{self.who()} hit a sign-in wall running `{clip(command, 120)}`: {tool} wants you signed "
+                           "in. " + (f"Sign in on your computer (it suggests `{hint.group(1)}`)" if hint else
+                                     "Sign in to it on your computer") + ", so later runs can use it.")
 
 
 class CodexEngine(Engine):
@@ -145,6 +154,7 @@ class CodexEngine(Engine):
     def __init__(self, *args):
         super().__init__(*args)
         self.requests = {}  # request id -> (method, params) for an approval waiting on the user
+        self.file_changes = {}  # item id -> the files a change Codex wants to make touches
 
     def start(self) -> None:
         executable = codex.resolve_bin(self.cfg)
@@ -213,6 +223,9 @@ class CodexEngine(Engine):
                 total = (params.get("tokenUsage") or {}).get("total") or {}
                 self.tokens_total = int(total.get("totalTokens") or 0)
                 self.tokens_used = max(0, self.tokens_total - int(total.get("cachedInputTokens") or 0))
+            elif method == "item/started" and (params.get("item") or {}).get("type") == "fileChange":
+                item = params["item"]  # for an approval of it, which names only the item
+                self.file_changes[item.get("id")] = [c.get("path") for c in item.get("changes") or [] if c.get("path")]
             elif method == "item/completed":
                 item = params.get("item") or {}
                 if item.get("type") == "agentMessage" and item.get("text"):
@@ -240,22 +253,27 @@ class CodexEngine(Engine):
         why = f" ({params['reason'][:200]})" if params.get("reason") else ""
         # v2 approvals answer "decline"; the older v1 ones answer "denied".
         refuse = {"decision": "decline" if method.startswith("item/") else "denied"}
-        if method == "item/tool/requestUserInput":
+        if method == "item/tool/requestUserInput":  # Codex's own question tool (runs ask through Reset's ask_user)
             questions = params.get("questions") or []
-            self.client.respond(request_id, {"answers": {q.get("id"): {"answers": [UNATTENDED_ANSWER]}
+            self.client.respond(request_id, {"answers": {q.get("id"): {"answers": [asking.NOT_WAITING]}
                                                          for q in questions}})
             asked = " / ".join(q.get("question") or q.get("header") or "" for q in questions).strip()
-            self.alerts.append(f"{who} asked: “{asked[:300]}”. Nobody could answer in time, so I told it to "
-                               "decide itself; its choice will be in the summary.")
+            self.alerts.append(f"{who} asked: “{asked[:300]}”. Codex's own question tool can't reach you, so I "
+                               "told it to decide itself; its choice will be in the summary.")
         elif method in APPROVALS and asking.wait_seconds(self.cfg) > 0:  # ask the user: Allow or Deny
             self.requests[request_id] = (method, params)
+            detail = None
             if method in ("item/commandExecution/requestApproval", "execCommandApproval"):
-                action = f"run `{shown(params.get('command'))}`"
+                action, detail = "run a command", shown(params.get("command"), 600)
             elif method in ("item/fileChange/requestApproval", "applyPatchApproval"):
                 action = "change files" + (f" in {params['grantRoot']}" if params.get("grantRoot") else "")
-            else:
+                paths = list(params.get("fileChanges") or {}) or self.file_changes.get(params.get("itemId")) or []
+                detail = "\n".join(paths[:10]) + (f"\n…and {len(paths) - 10} more" if len(paths) > 10 else "")
+            else:  # everything asked for is granted on Allow, so show all of it
                 action = "get extra permissions"
-            self.asking.append((request_id, "permission", {"action": action, "reason": params.get("reason")}))
+                detail = clip(json.dumps(params.get("permissions") or {}, ensure_ascii=False), 600)
+            self.asking.append((request_id, "permission", {"action": action, "detail": detail or None,
+                                                           "reason": params.get("reason")}))
         elif method in ("item/commandExecution/requestApproval", "execCommandApproval"):
             self.client.respond(request_id, refuse)
             command = shown(params.get("command"))
@@ -274,8 +292,6 @@ class CodexEngine(Engine):
         else:
             self.client.respond(request_id, error={"code": -32601, "message": "Reset runs are unattended"})
             self.alerts.append(f"{who} sent a request Reset doesn't handle ({method}), so it was refused.")
-
-    requests: dict
 
     def settle(self, request_id, row) -> None:
         """Answer an approval request with what the user said (no answer in time is a no)."""
@@ -396,7 +412,8 @@ class ClaudeEngine(StreamEngine):
     def __init__(self, *args):
         super().__init__(*args)
         self.usage, self.tool_uses, self.waiting, self.requests = {}, {}, {}, 0
-        self.inputs = {}  # request id -> (tool, input) for a question or permission prompt waiting on the user
+        self.inputs = {}  # request id -> (tool, input, tool use id): a question or permission prompt for the user
+        self.local_servers = frozenset()  # MCP servers the run's own folder defines (runtools.project_servers)
         self.tools = runtools.allowed(self.cfg)  # the user's MCP tools this run may use (Reset's hook checks)
         # The session id, chosen up front. It becomes the run's chat (thread_id) once Claude Code has started it,
         # so a run that never got going has no chat to open or hand over.
@@ -431,8 +448,8 @@ class ClaudeEngine(StreamEngine):
         if not executable:
             raise RuntimeError("Claude Code CLI not found")
         self.spawn(self.args(executable), self.run["workdir"], stdin=subprocess.PIPE)
-        hooks = runtools.claude_hooks(self.cfg)  # Claude Code checks each MCP tool call with Reset (hooked)
-        self.control("initialize", **({"hooks": hooks} if hooks else {}))
+        self.local_servers = runtools.project_servers(self.run["workdir"])
+        self.control("initialize", hooks=runtools.CLAUDE_HOOKS)  # Claude Code checks each MCP tool call (hooked)
         if self.cfg["runs"]["showInApps"]:
             # The live view ends with the run; the finished chat moves to Claude Desktop (apps.sweep).
             self.control("remote_control", enabled=True, name=apps.title(self.run, self.idea))
@@ -474,21 +491,28 @@ class ClaudeEngine(StreamEngine):
             self.asking.append((request_id, "question", {"questions": data.get("questions") or []}))
             return
         detail = data.get("command") or data.get("file_path") or data.get("url")
-        action = f"use {tool}" + (f" (`{str(detail)[:150]}`)" if detail else "")
-        self.asking.append((request_id, "permission", {"action": action, "reason": data.get("description")}))
+        self.asking.append((request_id, "permission", {"action": f"use {tool}",
+                                                       "detail": clip(str(detail), 600) if detail else None,
+                                                       "reason": data.get("description")}))
 
     def hooked(self, request_id, request: dict) -> None:
-        """Claude Code checks each MCP tool call with Reset first: one the user hasn't allowed runs is refused."""
-        tool = (request.get("input") or {}).get("tool_name") or ""
-        decision = runtools.claude_decision(self.tools, tool) if request.get("callback_id") == \
-            runtools.CLAUDE_HOOK_ID else {}
+        """Claude Code checks each MCP tool call with Reset first: one the user hasn't allowed runs is refused. The
+        setting is read at each call, so narrowing it reaches this run too. Anything unexpected is refused."""
+        data = request.get("input") or {}
+        tool = data.get("tool_name") or ""
+        if request.get("callback_id") != runtools.CLAUDE_HOOK_ID or not tool:
+            decision = runtools.REFUSED
+        else:
+            decision = runtools.claude_decision(runtools.allowed(config.load()), tool, data.get("tool_input"),
+                                                self.local_servers)
         if decision:
             self.reported.add(request.get("tool_use_id"))  # its "wasn't allowed" would say the wrong thing
-            server = runtools.claude_server(tool)
-            name = re.sub(r"^claude_ai_", "", server).replace("_", " ")
+            server = (str((data.get("tool_input") or {}).get("server") or "") if tool in runtools.RESOURCE_TOOLS
+                      else runtools.claude_server(tool))
+            name = re.sub(r"^claude_ai_", "", server).replace("_", " ") or "an MCP tool"
             if f"tool:{server}" not in self.reported:
                 self.reported.add(f"tool:{server}")
-                self.alerts.append(f"{self.who()} tried to use {name}, one of your tools runs can't use, so it was "
+                self.alerts.append(f"{self.who()} tried to use {name}, which runs aren't allowed to use, so it was "
                                    f"refused. To allow it, ask me to let runs use {name}.")
         self.send({"type": "control_response", "response": {"subtype": "success", "request_id": request_id,
                                                             "response": decision}})
@@ -718,7 +742,7 @@ def hold(conn, run_id: int, engine: Engine, stop: threading.Event, tracker: PidT
 
 
 def raise_alerts(conn, run_id: int, engine: Engine) -> None:
-    """Tell the user each time a run is refused something or asks a question, up to a few messages per run."""
+    """Tell the user each time a run is blocked or refused something, up to a few messages per run."""
     while engine.alerts:
         text = engine.alerts.pop(0)
         conn.execute("UPDATE runs SET blocked = blocked + 1 WHERE id = ?", (run_id,))
@@ -750,7 +774,7 @@ def completion_text(run, idea, outcome: str, engine: Engine, error: str | None, 
     if outcome == "failed" and error:
         text += f"\nError: {error}"
     if run["blocked"]:
-        text += (f"\nIt was refused something or asked a question {run['blocked']} time"
+        text += (f"\nIt was blocked or refused something {run['blocked']} time"
                  + ("s." if run["blocked"] > 1 else ".") + " See the alerts above.")
     if engine.summary:
         summary = engine.summary.strip()

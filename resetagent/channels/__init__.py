@@ -31,8 +31,9 @@ def order(conn, cfg: dict, preferred: str | None = None) -> list:
 
 
 def deliver(conn, cfg: dict, text: str, preferred: str | None = None, built: dict | None = None,
-            buttons=None) -> str:
-    """Send through the first working channel. Buttons are shown where supported (Telegram)."""
+            buttons=None, verbatim: bool = False) -> str:
+    """Send through the first working channel. Buttons are shown where supported (Telegram). verbatim: send the
+    text exactly as it is (don't drop Markdown), for messages quoting what a run wrote, like a command."""
     built = built or build(cfg)
     errors = []
     for name in order(conn, cfg, preferred):
@@ -40,7 +41,7 @@ def deliver(conn, cfg: dict, text: str, preferred: str | None = None, built: dic
         if not channel.configured():
             continue
         try:
-            channel.send(text, buttons=buttons)
+            channel.send(text, buttons=buttons, verbatim=verbatim)
         except ChannelError as exc:
             errors.append(f"{name}: {exc}")
             continue

@@ -4,10 +4,11 @@ A run's question reaches Reset through its engine: Claude Code's AskUserQuestion
 channel), Codex's ask_user tool (which Reset serves over MCP) and Codex's approval requests. Reset texts it to the
 user with buttons, and the run waits up to runs.questionWaitMinutes for the answer. The answer can come from a
 button, a reply to the message, or the user telling Reset's AI in plain words (which Reset confirms in its own
-message). Unanswered in time, a question is left to the run and a permission is refused. Waiting spends no tokens,
-and the run's time limit pauses meanwhile (never past the next usage reset).
+message). Unanswered in time, a question is left to the run and a permission is refused, and that run doesn't ask
+again (the user is away). A run asks at most QUESTIONS_PER_RUN times. Waiting spends no tokens, and the run's time
+limit pauses meanwhile (never past the next usage reset).
 
-Passwords, tokens and keys never go through the chat: runs are told to have the user set those up on their Mac.
+Runs are told never to ask for passwords, tokens or keys, but to have the user set those up on their computer.
 """
 from __future__ import annotations
 
@@ -23,9 +24,12 @@ LEFT_TO_YOU = ("The user asked you to decide. Make the most reasonable choice, k
                "final summary.")
 NO_ANSWER = ("Nobody answered in time. Make the most reasonable choice yourself, keep going, and mention it in your "
              "final summary.")
-NOT_WAITING = ("Runs don't wait for answers right now. Make the most reasonable choice yourself, keep going, and "
+NOT_WAITING = ("The user can't be asked right now. Make the most reasonable choice yourself, keep going, and "
                "mention it in your final summary.")
 MAX_WAIT_MINUTES = 120  # the longest runs.questionWaitMinutes can be
+RUN_SERVER = "reset_questions"  # the name of the MCP server with ask_user in a Codex run (unlike any of the user's)
+QUESTIONS_PER_RUN = 10  # after this many, a run decides by itself and is refused anything it asks permission for
+NUMBERS = re.compile(r"[0-9]+(?:\.[0-9]+)?(?:[,\s]+[0-9]+(?:\.[0-9]+)?)*")  # "2", "1.2", "1, 3"
 
 
 def wait_seconds(cfg: dict) -> float:
@@ -44,19 +48,23 @@ def waiting(conn, run_id: int | None = None) -> list:
 
 
 def _message(row, who: str) -> tuple:
-    """The text and buttons that put a question (or a permission request) to the user."""
+    """The text and buttons that put a question (or a permission request) to the user. The text starts with its
+    number, and what the run wrote comes after it, as written (the message isn't reformatted)."""
     body, qid, nonce = json.loads(row["body"]), row["id"], row["nonce"]
     until = local(row["expires_at"])
     if row["kind"] == "permission":
-        text = (f"{who} wants to {body['action']} (permission #{qid})."
-                + (f" Its reason: {body['reason']}" if body.get("reason") else "")
-                + f"\nAllow it? If nobody answers by {until}, it's refused. (Or send “allow {qid}” or “deny {qid}”.)")
-        return text, [[{"text": "Allow", "data": f"qa:{qid}:{nonce}:y"}, {"text": "Deny", "data": f"qa:{qid}:{nonce}:n"}]]
+        text = (f"Permission #{qid}: {who} wants to {body['action']}"
+                + (f":\n{body['detail']}" if body.get("detail") else ".")
+                + (f"\nIts reason: {body['reason']}" if body.get("reason") else "")
+                + f"\nAllow it? If nobody answers by {until}, it's refused. (Or send “allow {qid}” or "
+                  f"“deny {qid}”.)")
+        return text, [[{"text": "Allow", "data": f"qa:{qid}:{nonce}:y"},
+                       {"text": "Deny", "data": f"qa:{qid}:{nonce}:n"}]]
     questions = body["questions"]
-    lines, buttons = [f"{who} asks you (question #{qid}):"], []
+    lines, buttons = [f"Question #{qid} from {who[:1].lower() + who[1:]}:"], []  # "from run #7 (Claude)"
     for qi, question in enumerate(questions, 1):
         prefix = f"Q{qi}: " if len(questions) > 1 else ""
-        lines.append(prefix + question["question"])
+        lines.append(prefix + question["question"] + (" (you can pick several)" if question.get("multiSelect") else ""))
         row_buttons = []
         for oi, option in enumerate(question.get("options") or [], 1):
             detail = f": {option['description']}" if option.get("description") else ""
@@ -65,15 +73,31 @@ def _message(row, who: str) -> tuple:
         if row_buttons:
             buttons.append(row_buttons)
     buttons.append([{"text": "Let it decide", "data": f"qa:{qid}:{nonce}:d"}])
-    lines.append(f"Tap an answer, reply to this message in your own words, or let it decide. If nobody answers by "
-                 f"{until}, it decides by itself. (Or send “answer {qid} 2”, or “answer {qid}: …”.)")
+    if not any(q.get("options") for q in questions):
+        lines.append(f"Reply to this message in your own words, or let it decide. If nobody answers by {until}, it "
+                     f"decides by itself. (Or send “answer {qid}: …”.)")
+    else:
+        typed = (f"“answer {qid} 1.2” for Q1's option 2" if len(questions) > 1 else
+                 f"“answer {qid} 2” for option 2")
+        lines.append(f"Tap an answer, reply to this message in your own words, or let it decide. If nobody answers by "
+                     f"{until}, it decides by itself. (Or send {typed}, or “answer {qid}: …”.)")
     return "\n".join(lines), buttons
 
 
 def ask(conn, cfg: dict, run_id: int, kind: str, body: dict, who: str):
-    """Put a question to the user and text it. Returns its row, or None when runs don't wait for answers."""
+    """Put a question to the user and text it. Returns its row, or None when the run shouldn't wait: asking is off,
+    an earlier question from this run went unanswered (the user is away), or it has asked too often."""
     wait = wait_seconds(cfg)
     if wait <= 0:
+        return None
+    before = conn.execute("SELECT COUNT(*) AS asked, COALESCE(SUM(status = 'expired'), 0) AS missed "
+                          "FROM questions WHERE run_id = ?", (run_id,)).fetchone()
+    if before["missed"]:
+        return None
+    if before["asked"] >= QUESTIONS_PER_RUN:
+        notify.enqueue(conn, "question-closed", f"Run #{run_id} has asked you {QUESTIONS_PER_RUN} times, so it won't "
+                       "ask again. It decides by itself, and anything it asks permission for is refused.",
+                       dedupe_key=f"questions-capped:{run_id}")
         return None
     at = now()
     qid = conn.execute("INSERT INTO questions(run_id, kind, nonce, body, created_at, expires_at) "
@@ -86,70 +110,95 @@ def ask(conn, cfg: dict, run_id: int, kind: str, body: dict, who: str):
     return row
 
 
-def _settle(conn, row, answer: dict, via: str, done: bool = True) -> None:
-    """Save an answer. With several questions, taps collect answers until every question has one (done)."""
-    conn.execute("UPDATE questions SET status = ?, answer = ?, answered_via = ?, answered_at = ? "
-                 "WHERE id = ? AND status = 'waiting'", ("answered" if done else "waiting", json.dumps(answer), via,
-                                                         now() if done else None, row["id"]))
+def _settle(conn, row, answer: dict, via: str, done: bool = True) -> bool:
+    """Save an answer, unless the question changed since it was read (another answer, it closed, its run ended).
+    With several questions, answers collect until every question has one (done)."""
+    return conn.execute("UPDATE questions SET status = ?, answer = ?, answered_via = ?, answered_at = ? "
+                        "WHERE id = ? AND status = 'waiting' AND answer IS ?",
+                        ("answered" if done else "waiting", json.dumps(answer), via, now() if done else None,
+                         row["id"], row["answer"])).rowcount == 1
+
+
+def _closed(row) -> str:
+    return {"answered": f"Question #{row['id']} was already answered.",
+            "expired": f"Question #{row['id']} closed at {local(row['expires_at'])}.",
+            "waiting": f"Question #{row['id']} changed just now. Send your answer again.",
+            }.get(row["status"], f"Question #{row['id']} is closed: its run moved on or ended.")
 
 
 def answer(conn, question_id: int, reply: str, via: str) -> str:
-    """Record the user's answer. reply: "2" or "1.2" (an option), "decide", "allow"/"deny", or their own words.
-    Returns what to tell them."""
+    """Record the user's answer. reply: "2", "1.2" or "1, 3" (options), "decide", "allow"/"deny", or their own
+    words. Returns what to tell them."""
+    return _answer(conn, question_id, reply, via)[1]
+
+
+def _answer(conn, question_id: int, reply: str, via: str) -> tuple:
+    """(whether the answer was saved, what to tell the user)."""
     row = get(conn, question_id)
     if row is None:
-        return f"There's no question #{question_id}."
+        return False, f"There's no question #{question_id}."
     if row["status"] != "waiting":
-        return {"answered": f"Question #{question_id} was already answered.",
-                "expired": f"Question #{question_id} closed at {local(row['expires_at'])}.",
-                }.get(row["status"], f"Question #{question_id} is closed: its run moved on or ended.")
+        return False, _closed(row)
     text = str(reply).strip()
     run = f"run #{row['run_id']}"
     if row["kind"] == "permission":
         choice = text.lower().rstrip(".!")
         if choice in ("y", "yes", "allow", "ok", "okay", "sure", "go", "go ahead"):
-            _settle(conn, row, {"allow": True}, via)
-            return f"Allowed: {run} can go ahead."
-        if choice in ("n", "no", "deny", "don't", "dont", "stop", "refuse"):
-            _settle(conn, row, {"allow": False}, via)
-            return f"Denied: {run} will do without it."
-        return f"For permission #{question_id}, reply Allow or Deny."
+            allow, said = True, f"Allowed: {run} can go ahead."
+        elif choice in ("n", "no", "deny", "don't", "dont", "stop", "refuse"):
+            allow, said = False, f"Denied: {run} will do without it."
+        else:
+            return False, f"For permission #{question_id}, reply Allow or Deny."
+        return _saved(conn, row, {"allow": allow}, via, said)
     questions = json.loads(row["body"])["questions"]
     answers = (json.loads(row["answer"]) if row["answer"] else {}).get("answers") or {}
     open_questions = [q["question"] for q in questions if q["question"] not in answers]
     if text.lower() in ("d", "decide", "let it decide"):
         answers.update({q: LEFT_TO_YOU for q in open_questions})
-        _settle(conn, row, {"answers": answers, "decided": len(open_questions) == len(questions)}, via)
-        return f"OK: {run} will decide by itself."
-    picked = _pick(questions, text)
+        return _saved(conn, row, {"answers": answers, "decided": len(open_questions) == len(questions)}, via,
+                      f"OK: {run} will decide by itself.")
+    picked = _pick(questions, text) if NUMBERS.fullmatch(text) else None
     if picked is not None:
         answers.update(picked)
         left = [q for q in open_questions if q not in picked]
-        _settle(conn, row, {"answers": answers}, via, done=not left)
-        if left:
-            return f"Got it: {'; '.join(picked.values())}. {len(left)} more to answer on question #{question_id}."
-        return f"Sent to {run}: " + "; ".join(answers[q["question"]] for q in questions) + "."
-    if re.fullmatch(r"\d+(?:\.\d+)?", text) and any(q.get("options") for q in questions):  # a mistyped option
-        return (f"That isn't one of question #{question_id}'s options. Tap one, send “answer {question_id} "
-                f"{'1.2' if len(questions) > 1 else '1'}”, or answer in words.")
+        said = (f"Got it: {'; '.join(picked.values())}. {len(left)} more to answer on question #{question_id}."
+                if left else f"Sent to {run}: " + "; ".join(answers[q["question"]] for q in questions) + ".")
+        return _saved(conn, row, {"answers": answers}, via, said, done=not left)
+    if NUMBERS.fullmatch(text) and any(q.get("options") for q in questions):  # a mistyped option
+        return False, (f"That isn't one of question #{question_id}'s options. Tap one, send “answer {question_id} "
+                       f"{'1.2' if len(questions) > 1 else '1'}”, or answer in words.")
     # Their own words answer whatever is still open; the run reads them as it needs.
     answers.update({q: text for q in open_questions})
-    _settle(conn, row, {"answers": answers}, via)
-    return f"Sent to {run}: “{text}”."
+    return _saved(conn, row, {"answers": answers}, via, f"Sent to {run}: “{text}”.")
+
+
+def _saved(conn, row, answer: dict, via: str, said: str, done: bool = True) -> tuple:
+    """Save the answer and say so, or say why it couldn't be saved."""
+    if _settle(conn, row, answer, via, done):
+        return True, said
+    return False, _closed(get(conn, row["id"]))
 
 
 def _pick(questions: list, text: str) -> dict | None:
-    """An option chosen by number: "2", or "1.2" (question 1, option 2) when there are several. None otherwise."""
-    parts = text.split(".")
-    if not all(p.isdigit() for p in parts) or len(parts) > 2 or (len(parts) == 1 and len(questions) > 1):
-        return None
-    qi, oi = (1, int(parts[0])) if len(parts) == 1 else (int(parts[0]), int(parts[1]))
-    if not 1 <= qi <= len(questions):
-        return None
-    options = questions[qi - 1].get("options") or []
-    if not 1 <= oi <= len(options):
-        return None
-    return {questions[qi - 1]["question"]: options[oi - 1]["label"]}
+    """Options chosen by number: "2", "1.2" (question 1, option 2), or several like "1, 3" where a question takes
+    more than one. None if they aren't all real options."""
+    chosen = {}
+    for token in re.split(r"[,\s]+", text.strip()):
+        qi, _, oi = token.rpartition(".")
+        if not qi and len(questions) > 1:
+            return None  # which question?
+        qi, oi = int(qi or 1), int(oi)
+        options = (questions[qi - 1].get("options") or []) if 1 <= qi <= len(questions) else []
+        if not 1 <= oi <= len(options):
+            return None
+        chosen.setdefault(qi - 1, []).append(options[oi - 1]["label"])
+    picked = {}
+    for qi, labels in chosen.items():
+        labels = list(dict.fromkeys(labels))
+        if len(labels) > 1 and not questions[qi].get("multiSelect"):
+            return None
+        picked[questions[qi]["question"]] = ", ".join(labels)
+    return picked
 
 
 def answer_by_ai(conn, question_id: int, text: str) -> dict:
@@ -158,9 +207,8 @@ def answer_by_ai(conn, question_id: int, text: str) -> dict:
     if row is not None and row["kind"] == "permission":
         return {"sent": False, "reason": "Only the user can allow or deny a run's request: ask them to tap Allow "
                                          "or Deny."}
-    reply = answer(conn, question_id, text, via="ai")
-    sent = get(conn, question_id)
-    if row is None or row["status"] != "waiting" or (sent["status"], sent["answer"]) == (row["status"], row["answer"]):
+    saved, reply = _answer(conn, question_id, text, via="ai")
+    if not saved:
         return {"sent": False, "reason": reply}  # nothing went to the run, and reply says why
     notify.enqueue(conn, "question-answer", f"Reset's AI answered question #{question_id} for you. {reply}",
                    dedupe_key=f"question-answer:{question_id}:{secrets.token_hex(4)}")
@@ -172,10 +220,16 @@ def expire(conn, row):
     moved = conn.execute("UPDATE questions SET status = 'expired', answered_via = 'timeout', answered_at = ? "
                          "WHERE id = ? AND status = 'waiting'", (now(), row["id"])).rowcount
     if moved:
-        what, outcome = (("permission", "so it was refused") if row["kind"] == "permission" else
-                         ("question", f"so run #{row['run_id']} decided by itself"))
-        notify.enqueue(conn, "question-closed", f"No answer to {what} #{row['id']} in time, {outcome}.",
-                       dedupe_key=f"question-closed:{row['id']}")
+        run = f"run #{row['run_id']}"
+        latest = get(conn, row["id"])
+        if row["kind"] == "permission":
+            text = f"No answer to permission #{row['id']} in time, so it was refused, and {run} won't ask you again."
+        elif latest["answer"]:
+            text = (f"Question #{row['id']} wasn't fully answered in time, so {run} took your answers so far, decided "
+                    "the rest by itself, and won't ask you again.")
+        else:
+            text = f"No answer to question #{row['id']} in time, so {run} decided by itself, and won't ask you again."
+        notify.enqueue(conn, "question-closed", text, dedupe_key=f"question-closed:{row['id']}")
     return get(conn, row["id"])
 
 
@@ -198,10 +252,10 @@ def listing(conn) -> list:
         entry = {"question": row["id"], "run": row["run_id"], "kind": row["kind"],
                  "closesAt": local(row["expires_at"])}
         if row["kind"] == "permission":
-            entry["wantsTo"] = body["action"]
+            entry["wantsTo"] = body["action"] + (f": {body['detail']}" if body.get("detail") else "")
         else:
-            entry["asks"] = [{"question": q["question"], "options": [o["label"] for o in q.get("options") or []]}
-                             for q in body["questions"]]
+            entry["asks"] = [{"question": q["question"], "options": [o["label"] for o in q.get("options") or []],
+                              **({"pickSeveral": True} if q.get("multiSelect") else {})} for q in body["questions"]]
         items.append(entry)
     return items
 

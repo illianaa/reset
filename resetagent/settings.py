@@ -2,7 +2,9 @@
 
 Every change the AI makes is also announced by Reset itself, in a message the AI doesn't write, with an Undo
 button. So a setting can't change without the user seeing it, even if text hidden in a run's output talked the AI
-into it. Approving runs, redeeming resets and the chat connection are not settings: the AI can't touch them.
+into it. Giving runs more access (their tools, or full access) takes more than that: Reset asks the user, and only
+their tap makes the change. Approving runs, redeeming resets and the chat connection are not settings: the AI can't
+touch them.
 """
 from __future__ import annotations
 
@@ -18,6 +20,10 @@ from resetagent.timeutil import now
 
 class SettingError(ValueError):
     """The setting or value isn't allowed; the message says what is."""
+
+
+class AskedUser(Exception):
+    """The change gives runs more access, so Reset asked the user to confirm it with a tap."""
 
 
 @dataclass(frozen=True)
@@ -51,13 +57,15 @@ SETTINGS = {
                             "runs live in the Claude app before they move to Claude Desktop.", "switch"),
     "projects_folder": Setting(("runs", "projectsRoot"), "the projects folder", "Where the user's projects live and "
                                "new ones go. \"auto\" finds ~/Projects, ~/code and the like.", "folder"),
-    "run_tools": Setting(("runs", "tools"), "which tools runs can use", "Which of the user's connected tools runs "
+    "run_tools": Setting(("runs", "tools"), "runs' access to your tools", "Which of the user's connected tools runs "
                          "can use: connectors (Gmail, Slack, GitHub…), plugins and MCP servers, on Codex and Claude "
                          "Code. \"all\", \"none\" (runs keep their built-in tools and Reset's question tool), or "
-                         "names from list_run_tools, like \"github, openaiDeveloperDocs\".", "tools"),
-    "question_wait_minutes": Setting(("runs", "questionWaitMinutes"), "how long runs wait for your answers",
-                                     "Minutes a run waits for your answer to its question before deciding by itself "
-                                     "(0: runs don't ask).", "number", 0, asking.MAX_WAIT_MINUTES, unit=" min"),
+                         "names from list_run_tools, like \"github, slack\". Allowing more needs the user's tap.",
+                         "tools"),
+    "question_wait_minutes": Setting(("runs", "questionWaitMinutes"), "the wait for your answers",
+                                     "Minutes a run waits for the user's answer to a question or permission request. "
+                                     "Then it decides by itself, a permission is refused, and it doesn't ask again. "
+                                     "0: runs don't ask.", "number", 0, asking.MAX_WAIT_MINUTES, unit=" min"),
     "usage_check_minutes": Setting(("monitor", "statusMinutes"), "how often usage is read", "Minutes between "
                                    "usage readings (and status updates).", "number", 5, 240, unit=" min"),
     "reset_reminder_days": Setting(("monitor", "grantNoticeDays"), "one-time reset reminders", "Days before a "
@@ -95,7 +103,10 @@ def show(name: str, value) -> str:
     if setting.kind == "folder":
         return "found automatically" if not value else workspace.short(value)
     if setting.kind == "tools":
-        return "all your tools" if value == runtools.ALL else ", ".join(value) if value else "none of your tools"
+        if value == runtools.ALL:
+            return "all your tools"
+        names = [v.strip() for v in value.split(",")] if isinstance(value, str) else value or []
+        return ", ".join(n for n in names if n) or "none of your tools"
     if setting.kind == "number" and setting.unit == " tokens":
         return f"{value / 1000:g}k tokens"
     return f"{value}{setting.unit}"
@@ -139,9 +150,9 @@ def parse(name: str, value):
             raise SettingError(f"{name} is a list of days from 1 to 60, like “7, 1”, or “off”.")
         return days
     if setting.kind == "tools":
-        if text in ("all", "everything", "any", "all tools", "all my tools"):
+        if text in ("all", "everything", "any", "all tools", "all my tools", "all your tools"):
             return runtools.ALL
-        if text in ("", "none", "no", "nothing", "off", "[]", "no tools"):
+        if text in ("", "none", "no", "nothing", "off", "[]", "no tools", "none of your tools"):
             return []
         names, seen = [], set()
         # "github, slack", "github and slack" or ["github", "slack"]
@@ -176,18 +187,41 @@ def listing(cfg: dict) -> dict:
                                " or ".join(s.choices) if s.kind == "choice" else
                                {"switch": "on or off", "days": "days from 1 to 60, like “7, 1”, or “off”",
                                 "folder": "a folder in your home folder, or “auto”",
-                                "tools": "“all”, “none”, or tool names from list_run_tools, like “github, slack”"
+                                "tools": "“all”, “none”, or tool names from list_run_tools, like "
+                                         "“github, slack”"
                                 }[s.kind])}
             for name, s in SETTINGS.items()}
 
 
+def widens(name: str, old, new) -> bool:
+    """Would this give runs more access: full access, or tools they didn't have?"""
+    if name == "access":
+        return new == "full" and old != "full"
+    if name == "run_tools":
+        if new == runtools.ALL or old == runtools.ALL:
+            return new == runtools.ALL and old != runtools.ALL
+        return bool({runtools.normalize(n) for n in new} - runtools.allowed({"runs": {"tools": old}}))
+    return False
+
+
 def change(conn, name: str, value, by_ai: bool) -> tuple:
-    """Check and save a setting. Returns (old, new). A change the AI made is announced, with an Undo button.
+    """Check and save a setting. Returns (old, new). A change the AI made is announced, with an Undo button, and one
+    that gives runs more access isn't made at all: Reset asks the user to confirm it (AskedUser).
 
     The announcement is queued in the same step as the save: if it can't be queued, nothing is saved.
     """
     new = parse(name, value)
     setting = SETTINGS[name]
+    old = _get(config.load(), setting)
+    if by_ai and widens(name, old, new):
+        nonce = secrets.token_hex(4)
+        db.kv_set(conn, f"setting-ask:{nonce}", {"name": name, "old": old, "new": new, "at": now()})
+        notify.enqueue(conn, "setting", f"Reset's AI wants to change {setting.label}: {show(name, old)} → "
+                       f"{show(name, new)}. That gives runs more access, so it's up to you. Tap Allow, or send "
+                       f"“confirm {nonce}”.", dedupe_key=f"setting-ask:{nonce}",
+                       buttons=[[{"text": "Allow", "data": f"setok:{nonce}"},
+                                 {"text": "Keep it as is", "data": f"setno:{nonce}"}]])
+        raise AskedUser(nonce)
     with db.transaction(conn), config.editing() as cfg:
         old = _get(cfg, setting)
         _parent(cfg, setting)[setting.path[-1]] = new
@@ -198,6 +232,25 @@ def change(conn, name: str, value, by_ai: bool) -> tuple:
                            f"{show(name, new)}. To put it back, tap Undo or send “undo {nonce}”.",
                            dedupe_key=f"setting:{nonce}", buttons=[[{"text": "Undo", "data": f"undo:{nonce}"}]])
     return old, new
+
+
+def confirm(conn, nonce: str, yes: bool) -> str:
+    """The user's answer to a change the AI asked for that gives runs more access (Allow, or Keep it as is)."""
+    record = db.kv_get(conn, f"setting-ask:{nonce}")
+    setting = SETTINGS.get(record["name"]) if record else None
+    if setting is None or now() - record["at"] > 86400:
+        return "That request is no longer open."
+    db.kv_delete(conn, f"setting-ask:{nonce}")
+    if not yes:
+        return f"OK: {setting.label} stays at {show(record['name'], record['old'])}."
+    with config.editing() as cfg:  # checked and changed under the same lock
+        current = _get(cfg, setting)
+        if current == record["old"]:
+            _parent(cfg, setting)[setting.path[-1]] = record["new"]
+    if current != record["old"]:
+        return f"{setting.label[0].upper() + setting.label[1:]} changed since, so I left it at " \
+               f"{show(record['name'], current)}."
+    return f"Done: {setting.label} is now {show(record['name'], record['new'])}."
 
 
 def undo(conn, nonce: str) -> str:

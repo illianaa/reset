@@ -40,9 +40,9 @@ Runs show up as chats in the user's apps, to read and continue any time. Codex r
 
 Runs have full access by default (`resetctl setup access` changes it), so they don't stall on permission prompts. If a run is refused something, Reset tells the user right away.
 
-Runs don't get the user's connected tools (connectors like Gmail, Slack or GitHub, plugins, MCP servers) unless the user allows them, by name or all at once, by asking Reset's AI. Never change this on their behalf.
+Runs don't get the user's connected tools (connectors like Gmail, Slack or GitHub, plugins, MCP servers) unless the user allows them, by name or all at once, by asking Reset's AI and then tapping Allow. Never change this on their behalf.
 
-Runs can ask the user a question, like a choice only they can make or a service they need to sign in to. Reset texts it with buttons, and the user taps an answer, replies in their own words, or tells Reset's AI. A run waits 5 minutes by default (the user can change the wait by asking Reset's AI), then decides by itself. Its time limit pauses while it waits. A sandboxed run that wants to do more gets Allow and Deny buttons, and no answer counts as no. Never answer a run's question or permission request on the user's behalf.
+Runs can ask the user a question, like a choice only they can make or a service they need to sign in to. Reset texts it with buttons, and the user taps an answer, replies in their own words, or tells Reset's AI. A run waits 5 minutes by default (the user can change the wait by asking Reset's AI), then decides by itself and doesn't ask again. Its time limit pauses while it waits. When a sandboxed run wants to do more, the user gets Allow and Deny buttons, and no answer counts as no. Never answer a run's question or permission request on the user's behalf.
 
 ## Rules
 

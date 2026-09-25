@@ -25,7 +25,9 @@ OPEN = re.compile(r"run:(\d+):open")  # "Open in Codex/Claude" under a finished 
 UNDO = re.compile(r"undo:([0-9a-f]{8})")  # "Undo" under a setting Reset's AI changed
 ANSWER = re.compile(r"qa:(\d+):([0-9a-f]{8}):(y|n|d|\d+\.\d+)")  # a tap on a run's question or permission request
 CHOICES = {"y": "allow", "n": "deny", "d": "decide"}
-ASKED = re.compile(r"\((?:question|permission) #(\d+)\)")  # how a question message names itself
+SETTING = re.compile(r"set(ok|no):([0-9a-f]{8})")  # Allow / Keep it as is, under more access the AI asked for
+# A reply to a run's question answers it, unless it's a command that acts by itself.
+KEEP = {"stop", "approve", "decline", "switch", "answer", "permit", "undo"}
 TAPS = {"y": ("yes", "Starting…"), "n": ("no", "Skipped."), "x": ("switch", "Switching…")}
 
 
@@ -79,14 +81,17 @@ class Telegram:
             raise ChannelError(f"Telegram: {str(data.get('description') or 'request failed')[:160]}")
         return data.get("result")
 
-    def send(self, text: str, buttons=None) -> None:
-        parts = chunks(plain(text))
+    last_ref = None  # the message_id of the last message sent (the one with the buttons)
+
+    def send(self, text: str, buttons=None, verbatim: bool = False) -> None:
+        parts = chunks(text if verbatim else plain(text))
         for index, part in enumerate(parts):
             payload = {"chat_id": self.settings["chatId"], "text": part, "disable_web_page_preview": True}
             if buttons and index == len(parts) - 1:
                 payload["reply_markup"] = {"inline_keyboard": [
                     [{"text": b["text"], "callback_data": b["data"]} for b in row] for row in buttons]}
-            self.call("sendMessage", payload)
+            sent = self.call("sendMessage", payload)
+            self.last_ref = str(sent["message_id"]) if isinstance(sent, dict) and "message_id" in sent else None
 
     def typing(self) -> None:
         try:
@@ -131,12 +136,24 @@ class Telegram:
             return 0
         if not self.owner(chat.get("id"), sender.get("id")) or not text.strip():
             return 0
-        # A reply to a run's question is the answer to it, in the user's own words.
-        asked = ASKED.search(((message.get("reply_to_message") or {}).get("text")) or "")
-        if asked:
+        # A reply to a run's question message answers it, in the user's own words.
+        replied = (message.get("reply_to_message") or {}).get("message_id")
+        sent = replied is not None and conn.execute(
+            "SELECT dedupe_key FROM notifications WHERE sent_via = ? AND message_ref = ?",
+            (self.name, str(replied))).fetchone()
+        asked = sent and re.fullmatch(r"question:(\d+)", sent["dedupe_key"] or "")
+        if asked and not self.acts(text):
             text = f"answer {asked.group(1)}: {text.strip()}"
         return int(persist_inbound(conn, self.name, str(update["update_id"]), str(sender.get("id")),
                                    text.strip(), message.get("date")))
+
+    @staticmethod
+    def acts(text: str) -> bool:
+        """A command that does its own thing even as a reply: stop, an approval with its code, "/…", "idea …"."""
+        from resetagent import commands  # (commands reaches the channels through notify)
+
+        body = text.strip()
+        return body.startswith("/") or bool(re.match(r"idea\b", body, re.I)) or commands.parse(body).kind in KEEP
 
     def callback(self, conn, query: dict) -> int:
         """A tap on Start/Skip becomes the equivalent typed command, so it goes through the same checks."""
@@ -146,7 +163,13 @@ class Telegram:
         opening = OPEN.fullmatch(query.get("data") or "")
         undoing = UNDO.fullmatch(query.get("data") or "")
         answering = ANSWER.fullmatch(query.get("data") or "")
-        if answering and self.owner(chat_id, (query.get("from") or {}).get("id")):
+        setting = SETTING.fullmatch(query.get("data") or "")
+        if setting and self.owner(chat_id, (query.get("from") or {}).get("id")):
+            verb = "confirm" if setting.group(1) == "ok" else "keep"
+            saved = int(persist_inbound(conn, self.name, f"cb:{query['id']}", str(query["from"]["id"]),
+                                        f"{verb} {setting.group(2)}", now()))
+            reply = "Changing it…" if verb == "confirm" else "Keeping it as is…"
+        elif answering and self.owner(chat_id, (query.get("from") or {}).get("id")):
             asked = conn.execute("SELECT status FROM questions WHERE id = ? AND nonce = ?",
                                  (int(answering.group(1)), answering.group(2))).fetchone()
             reply = "That question is no longer open."

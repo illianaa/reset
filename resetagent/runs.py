@@ -607,7 +607,8 @@ def summary_text(conn, at: float | None = None) -> str:
                          f"{local(question['expires_at'], at)} (reply to it, or send “answer {question['id']} …”)"
                          if question["kind"] == "question" else
                          f"  waiting for you to allow or deny permission #{question['id']} until "
-                         f"{local(question['expires_at'], at)} (“allow {question['id']}” or “deny {question['id']}”)")
+                         f"{local(question['expires_at'], at)} (“allow {question['id']}” or "
+                         f"“deny {question['id']}”)")
     for ask in conn.execute("SELECT * FROM asks WHERE status = 'pending' ORDER BY id").fetchall():
         lines.append(f"Request {ask['code']}: idea #{ask['idea_id']} with {engine_name(ask['engine'])}, "
                      f"expires {local(ask['expires_at'], at)}")

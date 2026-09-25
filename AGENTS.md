@@ -105,12 +105,13 @@ Invariants. Keep these true in every change:
 3. **Only the user approves runs**, with a code, a Telegram button, or `resetctl approve` in a real terminal. Brains get `tools.py` and nothing more: no approve or redeem tools.
    - The settings a brain can change are a fixed list in `settings.py`, and each value is checked.
    - Reset announces every change a brain makes in its own message, with an Undo button, so no setting changes without the user seeing it.
-   - A brain can pass the user's answer on to a run's question (`answer_question`), and Reset announces what it sent. Permission requests from sandboxed runs are the user's alone: only a tap or a typed `allow`/`deny` answers them.
+   - A brain can't give runs more access (more of the user's tools, or full access): Reset asks the user, and only their tap (or `confirm <code>`) makes that change.
+   - A brain can pass the user's answer on to a run's question (`answer_question`), and Reset announces what it sent. Permission requests from sandboxed runs are the user's alone: only their own tap, reply or typed `allow`/`deny` answers them.
 4. **Reset redemption is manual.** The Codex client blocks the redeem method (`FORBIDDEN` in `providers/codex.py`).
 5. **Stopping is enforced, not requested.** The supervisor kills every process a run was seen to spawn, identified by pid and start time, and verifies that none survived. After a restart, runs default to stopped.
 6. **The conversation is provider-neutral.** It's stored as plain text, and brain calls are stateless, so any model can answer the next message.
 7. **Unknown stays unknown.** Missing percentages or expiries are `None`, never 0. Cached data never authorizes a run.
-8. **Runs use only the connected tools the user allowed** (`runs.tools`: none by default). Enforcement fails closed: a Claude run's hook refuses any MCP tool not on the list, and a Codex run whose tools can't be checked doesn't start.
+8. **Runs use only the connected tools the user allowed** (`runs.tools`: none by default). Enforcement fails closed: a Claude run's hook refuses any MCP tool or resource not on the list (and any server the run's folder defines, unless all are allowed), and a Codex run whose tools can't be checked doesn't start. With full access a run can still start other programs as the user, so this guards against mistakes; sandboxed access is the hard boundary.
 
 Settings: `~/.reset/config.json`, written by `resetctl setup`, and by `settings.py` and the `floor` command when the user tunes Reset by chatting. Optional environment overrides are listed in `.env.example` and registered in `config.ENV_VARS`. Read them only through `config.env()`, which rejects unregistered names. Never commit secrets or personal data: `.env`, `~/.reset` and local notes are git-ignored.
 
