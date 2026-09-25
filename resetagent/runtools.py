@@ -9,8 +9,9 @@ MCP servers (no model is involved). Every one that isn't allowed is switched off
 with -c overrides; the user's config isn't touched, so a run's chat continued in the Codex app has everything again.
 Claude runs: with no tools allowed, Claude Code loads no MCP servers at all. Otherwise it loads the user's servers and
 connectors, and Reset's hook refuses any MCP tool (or MCP resource) that isn't allowed, reading the setting at each
-call, so an unknown one is refused too, and a narrower setting reaches runs already going. A server the run's own
-folder defines (.mcp.json) is refused unless everything is allowed, so a repo can't pass one off as an allowed name.
+call, so an unknown one is refused too, and a narrower setting reaches runs already going. Servers the run's own
+folder defines (.mcp.json) don't load unless everything is allowed (and the hook refuses them should one load), so
+a repo can't pass one off as an allowed name or run its server.
 
 This keeps a run's tools to what the user chose. A run with full access can still start other programs as the user,
 so it guards against mistakes, not against a run set on getting around it: sandboxed access is the hard boundary.
@@ -148,20 +149,27 @@ def codex_limits(executable: str, cfg: dict, cwd: str) -> list:
 
 # --- Claude --------------------------------------------------------------------------------------------------
 
-def claude_args(cfg: dict) -> list:
-    """No tools allowed: Claude Code loads no MCP servers at all. Otherwise they load (the hook guards names)."""
-    return [] if allowed(cfg) else ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+def claude_args(cfg: dict, folder: str) -> list:
+    """No tools allowed: Claude Code loads no MCP servers at all. Otherwise the user's load (the hook guards names),
+    but not the ones the run's folder defines, unless everything is allowed."""
+    names = allowed(cfg)
+    if not names:
+        return ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+    local = sorted(project_servers(folder))
+    return [] if names == ALL or not local else ["--settings", json.dumps({"disabledMcpjsonServers": local})]
 
 
 def project_servers(folder: str) -> frozenset:
-    """Normalized names of the MCP servers a run's folder (or a folder above it) defines in .mcp.json."""
+    """The names of the MCP servers a run's folder (or a folder above it) defines in .mcp.json, read the way Claude
+    Code reads it (an odd byte doesn't stop it)."""
     names = set()
     for place in [Path(folder), *Path(folder).parents]:
         try:
-            servers = json.loads((place / ".mcp.json").read_text()).get("mcpServers") or {}
-        except (OSError, ValueError, AttributeError):
+            data = json.loads((place / ".mcp.json").read_bytes().decode("utf-8", errors="replace"))
+        except (OSError, ValueError):
             continue
-        names |= {normalize(name) for name in servers if isinstance(name, str)}
+        servers = data.get("mcpServers") if isinstance(data, dict) else None
+        names |= {name for name in servers or {} if isinstance(name, str)}
     return frozenset(names)
 
 
@@ -186,7 +194,7 @@ def claude_decision(names, tool_name: str, tool_input=None, local=frozenset()) -
         server = claude_server(tool_name)
     else:
         return {}  # the run's built-in tools aren't the user's to limit here
-    if names == ALL or (server and matches(server, names) and normalize(server) not in local):
+    if names == ALL or (server and matches(server, names) and normalize(server) not in {normalize(n) for n in local}):
         return {}
     return REFUSED
 

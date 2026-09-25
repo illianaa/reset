@@ -212,25 +212,27 @@ def change(conn, name: str, value, by_ai: bool) -> tuple:
     """
     new = parse(name, value)
     setting = SETTINGS[name]
-    old = _get(config.load(), setting)
-    if by_ai and widens(name, old, new):
-        nonce = secrets.token_hex(4)
-        db.kv_set(conn, f"setting-ask:{nonce}", {"name": name, "old": old, "new": new, "at": now()})
-        notify.enqueue(conn, "setting", f"Reset's AI wants to change {setting.label}: {show(name, old)} → "
-                       f"{show(name, new)}. That gives runs more access, so it's up to you. Tap Allow, or send "
-                       f"“confirm {nonce}”.", dedupe_key=f"setting-ask:{nonce}",
-                       buttons=[[{"text": "Allow", "data": f"setok:{nonce}"},
-                                 {"text": "Keep it as is", "data": f"setno:{nonce}"}]])
-        raise AskedUser(nonce)
-    with db.transaction(conn), config.editing() as cfg:
+    asked = None
+    with db.transaction(conn), config.editing() as cfg:  # checked and changed under the same lock
         old = _get(cfg, setting)
-        _parent(cfg, setting)[setting.path[-1]] = new
-        if by_ai and old != new:
-            nonce = secrets.token_hex(4)
-            db.kv_set(conn, f"setting-undo:{nonce}", {"name": name, "old": old, "new": new, "at": now()})
-            notify.enqueue(conn, "setting", f"Reset's AI changed {setting.label}: {show(name, old)} → "
-                           f"{show(name, new)}. To put it back, tap Undo or send “undo {nonce}”.",
-                           dedupe_key=f"setting:{nonce}", buttons=[[{"text": "Undo", "data": f"undo:{nonce}"}]])
+        if by_ai and widens(name, old, new):
+            asked = secrets.token_hex(4)
+            db.kv_set(conn, f"setting-ask:{asked}", {"name": name, "old": old, "new": new, "at": now()})
+            notify.enqueue(conn, "setting", f"Reset's AI wants to change {setting.label}: {show(name, old)} → "
+                           f"{show(name, new)}. That gives runs more access, so it's up to you. Tap Allow, or send "
+                           f"“confirm {asked}”.", dedupe_key=f"setting-ask:{asked}",
+                           buttons=[[{"text": "Allow", "data": f"setok:{asked}"},
+                                     {"text": "Keep it as is", "data": f"setno:{asked}"}]])
+        else:
+            _parent(cfg, setting)[setting.path[-1]] = new
+            if by_ai and old != new:
+                nonce = secrets.token_hex(4)
+                db.kv_set(conn, f"setting-undo:{nonce}", {"name": name, "old": old, "new": new, "at": now()})
+                notify.enqueue(conn, "setting", f"Reset's AI changed {setting.label}: {show(name, old)} → "
+                               f"{show(name, new)}. To put it back, tap Undo or send “undo {nonce}”.",
+                               dedupe_key=f"setting:{nonce}", buttons=[[{"text": "Undo", "data": f"undo:{nonce}"}]])
+    if asked:  # (raised once the request is saved)
+        raise AskedUser(asked)
     return old, new
 
 

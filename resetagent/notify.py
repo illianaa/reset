@@ -9,6 +9,7 @@ from resetagent.timeutil import now
 
 MAX_ATTEMPTS = 8
 VERBATIM = {"question"}  # messages quoting what a run wrote (a command it wants to run) are sent exactly as is
+ANSWERABLE = {"question"}  # messages the user must be able to answer: retried until they expire, never just logged
 
 
 def enqueue(conn, kind: str, text: str, dedupe_key: str | None = None, channel: str | None = None,
@@ -40,7 +41,7 @@ def flush(conn, cfg: dict, built: dict | None = None, at: float | None = None) -
         try:
             via = channels.deliver(conn, cfg, row["text"], preferred=row["channel"], built=built,
                                    buttons=json.loads(row["buttons"]) if row["buttons"] else None,
-                                   verbatim=row["kind"] in VERBATIM)
+                                   verbatim=row["kind"] in VERBATIM, to_person=row["kind"] in ANSWERABLE)
         except ChannelError as exc:
             conn.execute("UPDATE notifications SET attempts = attempts + 1, last_attempt_at = ?, "
                          "last_error = ? WHERE id = ?", (at, str(exc)[:300], row["id"]))

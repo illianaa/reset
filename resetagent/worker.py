@@ -48,8 +48,9 @@ def run_tools_config(run_id: int) -> list:
     env = "{" + ", ".join(f"{key} = {toml(value)}" for key, value in
                           (("RESET_HOME", str(config.home())), ("PYTHONPATH", str(ROOT)))) + "}"
     server = f"mcp_servers.{asking.RUN_SERVER}"
+    # -E -s: no PYTHON* settings or user packages, which a project's own Codex config could add to its env
     return ["-c", f"{server}.command={toml(sys.executable)}",
-            "-c", f"{server}.args={toml(['-m', 'resetagent', 'ask-server', str(run_id)])}",
+            "-c", f"{server}.args={toml(['-E', '-s', '-m', 'resetagent', 'ask-server', str(run_id)])}",
             "-c", f"{server}.cwd={toml(str(ROOT))}",
             "-c", f"{server}.env={env}",
             "-c", f"{server}.enabled=true",
@@ -58,8 +59,14 @@ def run_tools_config(run_id: int) -> list:
             "-c", f"{server}.startup_timeout_sec=30"]
 
 
-def clip(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[:limit - 1] + "…"
+clip = asking.clip
+
+
+def signed_out(output: str) -> bool:
+    """Whether a failed command's output says a tool wants the user signed in: a short error that says so, or one
+    that names the login command (long output, like a test run, can mention logins in passing)."""
+    tail = output[-4000:]
+    return bool(SIGN_IN.search(tail) and (LOGIN_HINT.search(tail) or len(output.strip()) <= 400))
 
 
 def shown(command, limit: int = 200) -> str:
@@ -237,7 +244,7 @@ class CodexEngine(Engine):
                             self.reported.add(command)
                             self.alerts.append(f"{self.who()} was blocked by its sandbox running `{command}`. "
                                                f"{access_hint(self.cfg)}")
-                    elif item.get("exitCode") not in (0, None) and SIGN_IN.search(output[-4000:]):
+                    elif item.get("exitCode") not in (0, None) and signed_out(output):
                         self.sign_in(command, output[-4000:])
             elif method == "turn/completed":
                 turn = params.get("turn") or {}
@@ -265,6 +272,8 @@ class CodexEngine(Engine):
             detail = None
             if method in ("item/commandExecution/requestApproval", "execCommandApproval"):
                 action, detail = "run a command", shown(params.get("command"), 600)
+                if params.get("additionalPermissions"):  # granted too, on Allow
+                    detail += "\nand get: " + clip(json.dumps(params["additionalPermissions"], ensure_ascii=False), 300)
             elif method in ("item/fileChange/requestApproval", "applyPatchApproval"):
                 action = "change files" + (f" in {params['grantRoot']}" if params.get("grantRoot") else "")
                 paths = list(params.get("fileChanges") or {}) or self.file_changes.get(params.get("itemId")) or []
@@ -430,13 +439,14 @@ class ClaudeEngine(StreamEngine):
                 "--append-system-prompt", workspace.brief(self.run, self.cfg["runs"]["access"], wait / 60,
                                                           runtools.describe(self.tools)),
                 "--max-budget-usd", str(self.cfg["runs"]["claudeMaxBudgetUsd"]),
-                *runtools.claude_args(self.cfg), "--disallowedTools", OUTLIVES_RUN]
+                *runtools.claude_args(self.cfg, self.run["workdir"]), "--disallowedTools", OUTLIVES_RUN]
         if wait > 0:  # AskUserQuestion and permission prompts come to Reset, which asks the user
             args += ["--permission-prompt-tool", "stdio"]
         if self.cfg["runs"]["access"] == "full":
             args += ["--permission-mode", "bypassPermissions"]
         else:
-            args += ["--permission-mode", "acceptEdits", "--allowedTools", "Read,Write,Edit,Glob,Grep"]
+            # acceptEdits takes edits inside the run's folder; an edit anywhere else asks (or is refused)
+            args += ["--permission-mode", "acceptEdits", "--allowedTools", "Read,Glob,Grep"]
         if self.run["model"]:
             args += ["--model", self.run["model"]]
         if self.run["effort"]:
@@ -490,7 +500,9 @@ class ClaudeEngine(StreamEngine):
         if tool == "AskUserQuestion":
             self.asking.append((request_id, "question", {"questions": data.get("questions") or []}))
             return
-        detail = data.get("command") or data.get("file_path") or data.get("url")
+        # What Allow would let it do: the command, file or address, or else everything it passes the tool.
+        detail = data.get("command") or data.get("file_path") or data.get("url") or \
+            (json.dumps({k: v for k, v in data.items() if k != "description"}, ensure_ascii=False) if data else None)
         self.asking.append((request_id, "permission", {"action": f"use {tool}",
                                                        "detail": clip(str(detail), 600) if detail else None,
                                                        "reason": data.get("description")}))
@@ -509,7 +521,8 @@ class ClaudeEngine(StreamEngine):
             self.reported.add(request.get("tool_use_id"))  # its "wasn't allowed" would say the wrong thing
             server = (str((data.get("tool_input") or {}).get("server") or "") if tool in runtools.RESOURCE_TOOLS
                       else runtools.claude_server(tool))
-            name = re.sub(r"^claude_ai_", "", server).replace("_", " ") or "an MCP tool"
+            name = clip(re.sub(r"[^\w .-]", "", re.sub(r"^claude_ai_", "", server).replace("_", " ")), 60) or \
+                "an MCP tool"  # (the model writes the server name of a resource call)
             if f"tool:{server}" not in self.reported:
                 self.reported.add(f"tool:{server}")
                 self.alerts.append(f"{self.who()} tried to use {name}, which runs aren't allowed to use, so it was "
@@ -585,7 +598,7 @@ class ClaudeEngine(StreamEngine):
                     name, data = self.tool_uses.get(block.get("tool_use_id"), ("a tool", {}))
                     if block.get("is_error") and REFUSED.search(str(block.get("content"))):
                         self.refused(block.get("tool_use_id"), name, data)
-                    elif name == "Bash" and block.get("is_error") and SIGN_IN.search(str(block.get("content"))[-4000:]):
+                    elif name == "Bash" and block.get("is_error") and signed_out(str(block.get("content"))):
                         self.sign_in(shown(data.get("command")), str(block.get("content"))[-4000:])
             elif kind == "result":
                 subtype = event.get("subtype") or ""
