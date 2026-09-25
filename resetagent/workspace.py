@@ -186,8 +186,11 @@ def branch_work(run) -> dict:
             "uncommitted": status.stdout.splitlines()[:40] if status.returncode == 0 else None}
 
 
-def brief(run, access: str = "full") -> str:
-    """What the working agent is told about where it is and how an unattended run works."""
+def brief(run, access: str = "full", wait_minutes: float = 0, tools: str = "") -> str:
+    """What the working agent is told about where it is and how an unattended run works.
+
+    wait_minutes: how long the user's answer to a question is waited for (0: runs don't ask).
+    tools: which of the user's connected tools it may use (runtools.describe)."""
     workdir, kind, full = short(run["workdir"]), run["workspace"] or "scratch", access == "full"
     # Sandboxes protect .git (hooks could escape them), so only full-access runs can commit.
     commits = ("Commit working steps to this branch with clear messages." if full else
@@ -206,11 +209,25 @@ def brief(run, access: str = "full") -> str:
     }[kind]
     if not full:
         where += ("\n\nThis run is sandboxed: you can change files in this folder, but anything beyond that (the "
-                  "network, other folders, git commits, and for some agents any command) will be refused. Work "
-                  "within that, and list anything you couldn't do in your summary.")
+                  "network, other folders, git commits, and for some agents any command) "
+                  + (f"needs the user's OK, which Reset asks them for; with no answer in about {wait_minutes:g} "
+                     "minutes it's refused." if wait_minutes > 0 else "will be refused.")
+                  + " Work within that, and list anything you couldn't do in your summary.")
+    if tools:
+        where += "\n\n" + tools
     minutes = max(1, int((run["deadline_at"] - (run["started_at"] or now())) / 60))
-    return (f"{where}\n\nThis is an unattended Reset run. Nobody is watching live, so don't wait for answers: make "
-            "reasonable assumptions and list them in your final summary. You have about "
+    if wait_minutes > 0:
+        tool = "AskUserQuestion" if dict(run).get("engine") == "claude" else "the ask_user tool"
+        asking = ("This is an unattended Reset run: the user isn't watching live. If a decision only they can make "
+                  "would change the result, or you need something only they can do (like signing in to a service), "
+                  f"ask them with {tool}. Reset sends it to their phone and "
+                  f"waits about {wait_minutes:g} minutes; if nobody answers, decide yourself. Never ask for "
+                  "passwords, tokens or keys: ask them to set those up on their Mac. For everything else, don't "
+                  "wait: make reasonable assumptions and list them in your final summary.")
+    else:
+        asking = ("This is an unattended Reset run. Nobody is watching live, so don't wait for answers: make "
+                  "reasonable assumptions and list them in your final summary.")
+    return (f"{where}\n\n{asking} You have about "
             f"{minutes} minutes and a budget of about {run['budget_tokens'] // 1000}k tokens, and the run can be "
             "stopped at any moment, so work in steps that each leave things working, and "
             + ("save or commit after each one." if full else "save after each one.")

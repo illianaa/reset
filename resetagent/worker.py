@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 
-from resetagent import apps, config, db, ideas, notify, proctree, runs, workspace
+from resetagent import apps, asking, config, db, ideas, notify, proctree, runs, runtools, workspace
 from resetagent.providers import claude as claude_provider
 from resetagent.providers import codex
 from resetagent.providers.common import describe
@@ -28,6 +28,27 @@ LIMIT_TEXT = re.compile(r"(usage|rate)[ _-]?limit|limit (reached|hit)|hit your (
 # What a command's output looks like when a sandbox blocked it (files outside the folder, or the network).
 SANDBOX_BLOCK = re.compile(r"operation not permitted|read-only file system|could not resolve host|network is "
                            r"unreachable|name resolution|nodename nor servname|ENOTFOUND|EAI_AGAIN", re.IGNORECASE)
+# What a command's output looks like when a tool or service wants the user signed in.
+SIGN_IN = re.compile(r"not (?:logged|signed) in|please (?:log|sign) ?in|(?:log|sign)[ -]?in required|authentication "
+                     r"(?:is )?required|requires authentication|unauthenticated|no (?:valid )?credentials|missing "
+                     r"credentials|could not find credentials|run:?\s+[`'\"]?[\w.-]+ (?:auth )?login", re.IGNORECASE)
+# Where the output names the command that signs in ("Run `vercel login`", "try gh auth login").
+LOGIN_HINT = re.compile(r"\b(?:run|try|use):?\s+[`'\"]?((?:[\w.-]+ )?[\w.-]+ (?:auth )?login)\b", re.IGNORECASE)
+LAUNCHERS = {"npx", "bunx", "pnpx", "uvx", "sudo", "env", "command", "exec"}  # the tool is the word after these
+APPROVALS = ("item/commandExecution/requestApproval", "execCommandApproval", "item/fileChange/requestApproval",
+             "applyPatchApproval", "item/permissions/requestApproval")
+
+
+def run_tools_config(run_id: int) -> list:
+    """Codex config overrides that give a run Reset's ask_user tool: a small MCP server of its own. The tool
+    call may take as long as the longest wait, so a wait changed mid-run never cuts a question short."""
+    env = "{" + ", ".join(f"{key} = {json.dumps(value)}" for key, value in
+                          (("RESET_HOME", str(config.home())), ("PYTHONPATH", str(ROOT)))) + "}"
+    return ["-c", f"mcp_servers.reset.command={json.dumps(sys.executable)}",
+            "-c", f"mcp_servers.reset.args={json.dumps(['-m', 'resetagent', 'ask-server', str(run_id)])}",
+            "-c", f"mcp_servers.reset.env={env}",
+            "-c", f"mcp_servers.reset.tool_timeout_sec={asking.MAX_WAIT_MINUTES * 60 + 120}",
+            "-c", "mcp_servers.reset.startup_timeout_sec=30"]
 
 
 def shown(command) -> str:
@@ -88,29 +109,58 @@ class Engine:
         self.notices = []      # other news for the user, like where to watch the run live
         self.noticed = 0
         self.live_url = None
+        self.asking = []       # (request id, kind, body): questions for the user, not yet sent (sync_questions)
+        self.pending = {}      # request id -> question id: sent, waiting for the user's answer
+        self.withdrawn = []    # request ids answered somewhere else (the Claude app)
 
     def who(self) -> str:
         return f"Run #{self.run['id']} ({self.run['engine'].capitalize()})"
+
+    def settle(self, request_id, row) -> None:
+        """Give the run the answer to its question: the question's row, or None when runs don't wait."""
+
+    def sign_in(self, command: str, output: str) -> None:
+        """A command failed because a tool or service wants the user signed in: tell them, once per tool."""
+        words = [w.rsplit("/", 1)[-1] for w in command.split()]
+        while len(words) > 1 and words[0] in LAUNCHERS:
+            words.pop(0)
+        tool = words[0] if words else "a tool"
+        if f"sign-in:{tool}" in self.reported:
+            return
+        self.reported.add(f"sign-in:{tool}")
+        hint = LOGIN_HINT.search(output)
+        self.alerts.append(f"{self.who()} hit a sign-in wall running `{command[:120]}`: {tool} wants you signed in. "
+                           + (f"Sign in on your Mac (it suggests `{hint.group(1)}`)" if hint else "Sign in to it on "
+                              "your Mac") + ", so later runs can use it.")
 
 
 class CodexEngine(Engine):
     """One turn through `codex app-server`.
 
     Full access: no sandbox and no approval requests. Sandboxed: Reset spots commands the sandbox blocked from
-    their output, and declines at once when Codex asks to go further. Either way the user hears about it, and
-    the run never waits.
+    their output, and when Codex asks to go further, the user gets Allow / Deny (no answer in time is a no).
+    Either way the user hears about it. Questions reach the user through Reset's ask_user tool (asking.py).
     """
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.requests = {}  # request id -> (method, params) for an approval waiting on the user
 
     def start(self) -> None:
         executable = codex.resolve_bin(self.cfg)
         if not executable:
             raise RuntimeError("Codex CLI not found")
         workdir = self.run["workdir"]
-        self.client = codex.AppServer(executable, allowed=codex.RUN_METHODS, cwd=workdir)
+        wait = asking.wait_seconds(self.cfg)
+        # The user's connectors, plugins and MCP servers that runs may not use are switched off for this process.
+        limits = runtools.codex_limits(executable, self.cfg, workdir)
+        self.client = codex.AppServer(executable, allowed=codex.RUN_METHODS, cwd=workdir,
+                                      extra_args=limits + (run_tools_config(self.run["id"]) if wait > 0 else []))
         codex.initialize(self.client, "reset_run")
         access = self.cfg["runs"]["access"]
         full = access == "full"
-        thread = {"cwd": workdir, "developerInstructions": workspace.brief(self.run, access),
+        tools = runtools.describe(runtools.allowed(self.cfg))
+        thread = {"cwd": workdir, "developerInstructions": workspace.brief(self.run, access, wait / 60, tools),
                   "approvalPolicy": "never" if full else "on-request",
                   "sandbox": "danger-full-access" if full else "workspace-write"}
         if self.run["model"]:
@@ -167,13 +217,15 @@ class CodexEngine(Engine):
                 item = params.get("item") or {}
                 if item.get("type") == "agentMessage" and item.get("text"):
                     self.summary = item["text"]
-                elif (item.get("type") == "commandExecution" and self.cfg["runs"]["access"] != "full"
-                      and SANDBOX_BLOCK.search(item.get("aggregatedOutput") or "")):
-                    command = shown(item.get("command"))
-                    if command not in self.reported:
-                        self.reported.add(command)
-                        self.alerts.append(f"{self.who()} was blocked by its sandbox running `{command}`. "
-                                           f"{access_hint(self.cfg)}")
+                elif item.get("type") == "commandExecution":
+                    output, command = item.get("aggregatedOutput") or "", shown(item.get("command"))
+                    if self.cfg["runs"]["access"] != "full" and SANDBOX_BLOCK.search(output):
+                        if command not in self.reported:
+                            self.reported.add(command)
+                            self.alerts.append(f"{self.who()} was blocked by its sandbox running `{command}`. "
+                                               f"{access_hint(self.cfg)}")
+                    elif item.get("exitCode") not in (0, None) and SIGN_IN.search(output[-4000:]):
+                        self.sign_in(command, output[-4000:])
             elif method == "turn/completed":
                 turn = params.get("turn") or {}
                 self.finished = {"completed": "completed", "interrupted": "stopped"}.get(turn.get("status"), "failed")
@@ -195,6 +247,15 @@ class CodexEngine(Engine):
             asked = " / ".join(q.get("question") or q.get("header") or "" for q in questions).strip()
             self.alerts.append(f"{who} asked: “{asked[:300]}”. Nobody could answer in time, so I told it to "
                                "decide itself; its choice will be in the summary.")
+        elif method in APPROVALS and asking.wait_seconds(self.cfg) > 0:  # ask the user: Allow or Deny
+            self.requests[request_id] = (method, params)
+            if method in ("item/commandExecution/requestApproval", "execCommandApproval"):
+                action = f"run `{shown(params.get('command'))}`"
+            elif method in ("item/fileChange/requestApproval", "applyPatchApproval"):
+                action = "change files" + (f" in {params['grantRoot']}" if params.get("grantRoot") else "")
+            else:
+                action = "get extra permissions"
+            self.asking.append((request_id, "permission", {"action": action, "reason": params.get("reason")}))
         elif method in ("item/commandExecution/requestApproval", "execCommandApproval"):
             self.client.respond(request_id, refuse)
             command = shown(params.get("command"))
@@ -213,6 +274,19 @@ class CodexEngine(Engine):
         else:
             self.client.respond(request_id, error={"code": -32601, "message": "Reset runs are unattended"})
             self.alerts.append(f"{who} sent a request Reset doesn't handle ({method}), so it was refused.")
+
+    requests: dict
+
+    def settle(self, request_id, row) -> None:
+        """Answer an approval request with what the user said (no answer in time is a no)."""
+        method, params = self.requests.pop(request_id)
+        allow = row is not None and row["status"] == "answered" and json.loads(row["answer"]).get("allow") is True
+        if method == "item/permissions/requestApproval":
+            self.client.respond(request_id, {"permissions": (params.get("permissions") or {}) if allow else {}})
+        elif method.startswith("item/"):
+            self.client.respond(request_id, {"decision": "accept" if allow else "decline"})
+        else:
+            self.client.respond(request_id, {"decision": "approved" if allow else "denied"})
 
     def interrupt(self, timeout: float = 5.0) -> None:
         if self.finished or not self.turn_id:
@@ -322,6 +396,8 @@ class ClaudeEngine(StreamEngine):
     def __init__(self, *args):
         super().__init__(*args)
         self.usage, self.tool_uses, self.waiting, self.requests = {}, {}, {}, 0
+        self.inputs = {}  # request id -> (tool, input) for a question or permission prompt waiting on the user
+        self.tools = runtools.allowed(self.cfg)  # the user's MCP tools this run may use (Reset's hook checks)
         # The session id, chosen up front. It becomes the run's chat (thread_id) once Claude Code has started it,
         # so a run that never got going has no chat to open or hand over.
         self.session_id = str(uuid.uuid4())
@@ -331,11 +407,15 @@ class ClaudeEngine(StreamEngine):
         self.last_event_at = time.monotonic()  # when the chat last did something
 
     def args(self, executable: str) -> list:
+        wait = asking.wait_seconds(self.cfg)
         args = [executable, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                 "--session-id", self.session_id, "--name", apps.title(self.run, self.idea),
-                "--append-system-prompt", workspace.brief(self.run, self.cfg["runs"]["access"]),
+                "--append-system-prompt", workspace.brief(self.run, self.cfg["runs"]["access"], wait / 60,
+                                                          runtools.describe(self.tools)),
                 "--max-budget-usd", str(self.cfg["runs"]["claudeMaxBudgetUsd"]),
-                "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disallowedTools", OUTLIVES_RUN]
+                *runtools.claude_args(self.cfg), "--disallowedTools", OUTLIVES_RUN]
+        if wait > 0:  # AskUserQuestion and permission prompts come to Reset, which asks the user
+            args += ["--permission-prompt-tool", "stdio"]
         if self.cfg["runs"]["access"] == "full":
             args += ["--permission-mode", "bypassPermissions"]
         else:
@@ -351,7 +431,8 @@ class ClaudeEngine(StreamEngine):
         if not executable:
             raise RuntimeError("Claude Code CLI not found")
         self.spawn(self.args(executable), self.run["workdir"], stdin=subprocess.PIPE)
-        self.control("initialize")
+        hooks = runtools.claude_hooks(self.cfg)  # Claude Code checks each MCP tool call with Reset (hooked)
+        self.control("initialize", **({"hooks": hooks} if hooks else {}))
         if self.cfg["runs"]["showInApps"]:
             # The live view ends with the run; the finished chat moves to Claude Desktop (apps.sweep).
             self.control("remote_control", enabled=True, name=apps.title(self.run, self.idea))
@@ -385,6 +466,49 @@ class ClaudeEngine(StreamEngine):
                                 f"({reason})." + (" When it's done, tap Open in Claude to see it." if apps.desktop()
                                                   else ""))
 
+    def ask(self, request_id, request: dict) -> None:
+        """Claude Code wants the user: AskUserQuestion, or permission to use a tool (sandboxed runs)."""
+        tool, data = request.get("tool_name") or "a tool", request.get("input") or {}
+        self.inputs[request_id] = (tool, data, request.get("tool_use_id"))
+        if tool == "AskUserQuestion":
+            self.asking.append((request_id, "question", {"questions": data.get("questions") or []}))
+            return
+        detail = data.get("command") or data.get("file_path") or data.get("url")
+        action = f"use {tool}" + (f" (`{str(detail)[:150]}`)" if detail else "")
+        self.asking.append((request_id, "permission", {"action": action, "reason": data.get("description")}))
+
+    def hooked(self, request_id, request: dict) -> None:
+        """Claude Code checks each MCP tool call with Reset first: one the user hasn't allowed runs is refused."""
+        tool = (request.get("input") or {}).get("tool_name") or ""
+        decision = runtools.claude_decision(self.tools, tool) if request.get("callback_id") == \
+            runtools.CLAUDE_HOOK_ID else {}
+        if decision:
+            self.reported.add(request.get("tool_use_id"))  # its "wasn't allowed" would say the wrong thing
+            server = runtools.claude_server(tool)
+            name = re.sub(r"^claude_ai_", "", server).replace("_", " ")
+            if f"tool:{server}" not in self.reported:
+                self.reported.add(f"tool:{server}")
+                self.alerts.append(f"{self.who()} tried to use {name}, one of your tools runs can't use, so it was "
+                                   f"refused. To allow it, ask me to let runs use {name}.")
+        self.send({"type": "control_response", "response": {"subtype": "success", "request_id": request_id,
+                                                            "response": decision}})
+
+    def settle(self, request_id, row) -> None:
+        tool, data, tool_use_id = self.inputs.pop(request_id)
+        if tool == "AskUserQuestion":
+            reply = {"behavior": "allow",
+                     "updatedInput": {**data, "answers": asking.answers_for(row, data.get("questions") or [])}}
+        elif row is not None and row["status"] == "answered" and json.loads(row["answer"]).get("allow") is True:
+            reply = {"behavior": "allow", "updatedInput": data}
+        else:
+            said = ("Runs can't ask the user right now, so this was refused." if row is None else
+                    "The user said no." if row["status"] == "answered" else
+                    "Nobody answered in time, so this was refused.")
+            reply = {"behavior": "deny", "message": said + " Do without it, and mention it in your final summary."}
+            self.reported.add(tool_use_id)  # the user already heard about this one: no "wasn't allowed" alert
+        self.send({"type": "control_response", "response": {"subtype": "success", "request_id": request_id,
+                                                            "response": reply}})
+
     def refused(self, tool_use_id, name: str, data: dict) -> None:
         if tool_use_id is not None and tool_use_id in self.reported:
             return
@@ -406,9 +530,21 @@ class ClaudeEngine(StreamEngine):
                 self.bridge(event.get("state"), event.get("detail"))
             elif kind == "control_response":
                 self.answered(event.get("response") or {})
-            elif kind == "control_request":  # Claude Code asking its host something; nobody is there to answer
+            elif kind == "control_request" and (event.get("request") or {}).get("subtype") == "can_use_tool":
+                self.ask(event.get("request_id"), event["request"])
+            elif kind == "control_request" and (event.get("request") or {}).get("subtype") == "hook_callback":
+                self.hooked(event.get("request_id"), event["request"])
+            elif kind == "control_request":  # anything else Claude Code asks its host; nobody is there to answer
                 self.send({"type": "control_response", "response": {
                     "subtype": "error", "request_id": event.get("request_id"), "error": "Reset runs are unattended"}})
+            elif kind == "control_cancel_request":  # answered somewhere else, like the Claude app
+                request_id = event.get("request_id")
+                if request_id in self.inputs:
+                    del self.inputs[request_id]
+                    if request_id in self.pending:
+                        self.withdrawn.append(request_id)
+                    else:  # not texted to the user yet, so it never will be
+                        self.asking = [a for a in self.asking if a[0] != request_id]
             elif kind == "assistant":
                 message = event.get("message") or {}
                 self.usage[message.get("id")] = message.get("usage") or {}
@@ -418,12 +554,15 @@ class ClaudeEngine(StreamEngine):
                 texts = [b.get("text") for b in blocks if b.get("type") == "text"]
                 if any(texts):
                     self.summary = "\n".join(t for t in texts if t)
-            elif kind == "user":  # tool results: a refusal shows up here as it happens
+            elif kind == "user":  # tool results: a refusal or a sign-in wall shows up here as it happens
                 for block in (event.get("message") or {}).get("content") or []:
-                    if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error") \
-                            and REFUSED.search(str(block.get("content"))):
-                        self.refused(block.get("tool_use_id"), *self.tool_uses.get(block.get("tool_use_id"),
-                                                                                  ("a tool", {})))
+                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                        continue
+                    name, data = self.tool_uses.get(block.get("tool_use_id"), ("a tool", {}))
+                    if block.get("is_error") and REFUSED.search(str(block.get("content"))):
+                        self.refused(block.get("tool_use_id"), name, data)
+                    elif name == "Bash" and block.get("is_error") and SIGN_IN.search(str(block.get("content"))[-4000:]):
+                        self.sign_in(shown(data.get("command")), str(block.get("content"))[-4000:])
             elif kind == "result":
                 subtype = event.get("subtype") or ""
                 # someone pressed stop in the Claude app while watching the run live
@@ -500,6 +639,31 @@ class FakeEngine(StreamEngine):
 ENGINES = {"codex": CodexEngine, "claude": ClaudeEngine, "fake": FakeEngine}
 
 
+def sync_questions(conn, cfg: dict, run_id: int, engine: Engine) -> None:
+    """Send the run's questions to the user, and bring back their answers (or the lack of one) to the run."""
+    while engine.asking:
+        request_id, kind, body = engine.asking.pop(0)
+        row = asking.ask(conn, cfg, run_id, kind, body, engine.who())
+        if row is None:  # runs don't wait for answers
+            engine.settle(request_id, None)
+        else:
+            engine.pending[request_id] = row["id"]
+    while engine.withdrawn:  # answered in the Claude app: Claude Code already has the answer
+        question_id = engine.pending.pop(engine.withdrawn.pop(0), None)
+        if question_id is not None:
+            asking.close(conn, question_id, via="the Claude app")
+    for request_id, question_id in list(engine.pending.items()):
+        row = asking.get(conn, question_id)
+        if row["status"] == "waiting" and now() >= row["expires_at"]:
+            row = asking.expire(conn, row)
+        if row["status"] != "waiting":
+            del engine.pending[request_id]
+            engine.settle(request_id, row)
+    for row in asking.waiting(conn, run_id):  # a Codex run's ask_user questions, which its tool server waits on
+        if now() >= row["expires_at"] + 5:    # that server closes its own; this catches one that went away
+            asking.expire(conn, row)
+
+
 ALERTS_PER_RUN = 3
 HOLD_CHECK_SECONDS = 2   # how often a held-open chat checks whether you've left the Claude app
 HOLD_QUIET_SECONDS = 30  # a chat you're still talking to stays open until it has been quiet this long
@@ -530,6 +694,7 @@ def hold(conn, run_id: int, engine: Engine, stop: threading.Event, tracker: PidT
         if stop.is_set():
             return "stopped"
         engine.pump(0.5)
+        sync_questions(conn, engine.cfg, run_id, engine)
         raise_alerts(conn, run_id, engine)
         t = time.time()
         if t - checked < HOLD_CHECK_SECONDS:
@@ -634,9 +799,21 @@ def main(run_id: int) -> int:
                      (engine.thread_id, engine.turn_id, engine.live_url, run_id))
         raise_alerts(conn, run_id, engine)  # the live link goes out right away
         beat = 0.0
+        paused_at = None  # while the run waits for the user: since when, not yet added to its time limit
         while outcome is None:
             engine.pump(0.5)
+            sync_questions(conn, cfg, run_id, engine)
+            waiting = bool(asking.waiting(conn, run_id))
             t = time.time()
+            if paused_at is not None and (not waiting or t - beat >= 2):
+                # Time spent waiting for the user doesn't count against the run's time limit: the deadline moves
+                # back by it, but never past the latest the run may end (before a usage limit resets).
+                conn.execute("UPDATE runs SET deadline_at = MIN(deadline_at + ?, COALESCE(latest_end, "
+                             "deadline_at + ?)) WHERE id = ?", (t - paused_at, t - paused_at, run_id))
+                run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+                paused_at = None
+            if waiting and paused_at is None:
+                paused_at = t
             if t - beat >= 2:
                 beat = t
                 tracker.track()
@@ -654,7 +831,8 @@ def main(run_id: int) -> int:
                 outcome = "stopped"
             elif engine.tokens_used >= run["budget_tokens"]:
                 outcome = "budget"
-            elif t >= run["deadline_at"]:
+            # (while it waits, the deadline read above can trail the time added at each beat)
+            elif t >= run["deadline_at"] and not (waiting and t < (run["latest_end"] or float("inf"))):
                 outcome = "deadline"
         if outcome in ("stopped", "budget", "deadline"):
             engine.interrupt()
@@ -683,6 +861,7 @@ def main(run_id: int) -> int:
         raise_alerts(conn, run_id, engine)
         engine.close()
         survivors = proctree.terminate(tracker.targets(), grace=3)
+        asking.close_for_run(conn, run_id)  # an ended run takes no more answers
         at = now()
         # A Claude run that wasn't shown in the apps stays out of Claude Desktop, even if showing is turned on later.
         hidden = "not-shown" if run["engine"] == "claude" and not cfg["runs"]["showInApps"] else None

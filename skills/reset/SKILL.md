@@ -38,7 +38,11 @@ Several runs can go at once, by default up to 3 on each subscription. When one i
 
 Runs show up as chats in the user's apps, to read and continue any time. Codex runs are pinned in the Codex app as "Reset #N: …". Claude runs can be watched live in the Claude app (Reset texts the user the link), and once done they move into Claude Desktop's Code tab as soon as the user leaves the Claude app.
 
-Runs have full access by default (`resetctl setup access` changes it), so they don't stall on permission prompts. If a run is refused something, or asks a question nobody is there to answer, Reset tells the user right away.
+Runs have full access by default (`resetctl setup access` changes it), so they don't stall on permission prompts. If a run is refused something, Reset tells the user right away.
+
+Runs don't get the user's connected tools (connectors like Gmail, Slack or GitHub, plugins, MCP servers) unless the user allows them, by name or all at once, by asking Reset's AI. Never change this on their behalf.
+
+Runs can ask the user a question, like a choice only they can make or a service they need to sign in to. Reset texts it with buttons, and the user taps an answer, replies in their own words, or tells Reset's AI. A run waits 5 minutes by default (the user can change the wait by asking Reset's AI), then decides by itself. Its time limit pauses while it waits. A sandboxed run that wants to do more gets Allow and Deny buttons, and no answer counts as no. Never answer a run's question or permission request on the user's behalf.
 
 ## Rules
 

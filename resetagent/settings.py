@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import secrets
 
-from resetagent import config, db, models, notify, workspace
+from resetagent import asking, config, db, models, notify, runtools, workspace
 from resetagent.timeutil import now
 
 
@@ -25,7 +25,7 @@ class Setting:
     path: tuple        # where it lives in config.json
     label: str         # how messages name it
     about: str
-    kind: str          # number, switch, choice, days or folder
+    kind: str          # number, switch, choice, days, folder or tools
     low: int = 0
     high: int = 0
     choices: tuple = ()
@@ -51,6 +51,13 @@ SETTINGS = {
                             "runs live in the Claude app before they move to Claude Desktop.", "switch"),
     "projects_folder": Setting(("runs", "projectsRoot"), "the projects folder", "Where the user's projects live and "
                                "new ones go. \"auto\" finds ~/Projects, ~/code and the like.", "folder"),
+    "run_tools": Setting(("runs", "tools"), "which tools runs can use", "Which of the user's connected tools runs "
+                         "can use: connectors (Gmail, Slack, GitHub…), plugins and MCP servers, on Codex and Claude "
+                         "Code. \"all\", \"none\" (runs keep their built-in tools and Reset's question tool), or "
+                         "names from list_run_tools, like \"github, openaiDeveloperDocs\".", "tools"),
+    "question_wait_minutes": Setting(("runs", "questionWaitMinutes"), "how long runs wait for your answers",
+                                     "Minutes a run waits for your answer to its question before deciding by itself "
+                                     "(0: runs don't ask).", "number", 0, asking.MAX_WAIT_MINUTES, unit=" min"),
     "usage_check_minutes": Setting(("monitor", "statusMinutes"), "how often usage is read", "Minutes between "
                                    "usage readings (and status updates).", "number", 5, 240, unit=" min"),
     "reset_reminder_days": Setting(("monitor", "grantNoticeDays"), "one-time reset reminders", "Days before a "
@@ -87,6 +94,8 @@ def show(name: str, value) -> str:
         return ", ".join(f"{d}" for d in value) + (" day before" if value == [1] else " days before")
     if setting.kind == "folder":
         return "found automatically" if not value else workspace.short(value)
+    if setting.kind == "tools":
+        return "all your tools" if value == runtools.ALL else ", ".join(value) if value else "none of your tools"
     if setting.kind == "number" and setting.unit == " tokens":
         return f"{value / 1000:g}k tokens"
     return f"{value}{setting.unit}"
@@ -129,6 +138,25 @@ def parse(name: str, value):
         if not days or any(d < 1 or d > 60 for d in days):
             raise SettingError(f"{name} is a list of days from 1 to 60, like “7, 1”, or “off”.")
         return days
+    if setting.kind == "tools":
+        if text in ("all", "everything", "any", "all tools", "all my tools"):
+            return runtools.ALL
+        if text in ("", "none", "no", "nothing", "off", "[]", "no tools"):
+            return []
+        names, seen = [], set()
+        # "github, slack", "github and slack" or ["github", "slack"]
+        for part in re.split(r",|;|\n|\band\b", str(value).strip().strip("[]")):
+            part = part.strip().strip("\"'").strip()
+            if not part:
+                continue
+            if len(part) > 60 or not re.fullmatch(r"[\w .@+&'()-]+", part):
+                raise SettingError(f"{name}: “{part[:60]}” isn't a tool name.")
+            if runtools.normalize(part) not in seen:
+                seen.add(runtools.normalize(part))
+                names.append(part)
+        if not names or len(names) > 30:
+            raise SettingError(f"{name} is “all”, “none”, or up to 30 tool names, like “github, slack”.")
+        return names
     # a folder
     if text in ("", "auto", "none"):
         return None
@@ -147,7 +175,9 @@ def listing(cfg: dict) -> dict:
                    "allowed": (f"{s.low} to {s.high}" if s.kind == "number" else
                                " or ".join(s.choices) if s.kind == "choice" else
                                {"switch": "on or off", "days": "days from 1 to 60, like “7, 1”, or “off”",
-                                "folder": "a folder in your home folder, or “auto”"}[s.kind])}
+                                "folder": "a folder in your home folder, or “auto”",
+                                "tools": "“all”, “none”, or tool names from list_run_tools, like “github, slack”"
+                                }[s.kind])}
             for name, s in SETTINGS.items()}
 
 

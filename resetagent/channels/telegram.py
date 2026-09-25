@@ -23,6 +23,9 @@ COMMANDS = [("status", "Usage limits and one-time resets"), ("ideas", "Your idea
 CALLBACK = re.compile(r"ask:(\d+):([0-9a-f]{8}):([ynx])")
 OPEN = re.compile(r"run:(\d+):open")  # "Open in Codex/Claude" under a finished run
 UNDO = re.compile(r"undo:([0-9a-f]{8})")  # "Undo" under a setting Reset's AI changed
+ANSWER = re.compile(r"qa:(\d+):([0-9a-f]{8}):(y|n|d|\d+\.\d+)")  # a tap on a run's question or permission request
+CHOICES = {"y": "allow", "n": "deny", "d": "decide"}
+ASKED = re.compile(r"\((?:question|permission) #(\d+)\)")  # how a question message names itself
 TAPS = {"y": ("yes", "Starting…"), "n": ("no", "Skipped."), "x": ("switch", "Switching…")}
 
 
@@ -128,6 +131,10 @@ class Telegram:
             return 0
         if not self.owner(chat.get("id"), sender.get("id")) or not text.strip():
             return 0
+        # A reply to a run's question is the answer to it, in the user's own words.
+        asked = ASKED.search(((message.get("reply_to_message") or {}).get("text")) or "")
+        if asked:
+            text = f"answer {asked.group(1)}: {text.strip()}"
         return int(persist_inbound(conn, self.name, str(update["update_id"]), str(sender.get("id")),
                                    text.strip(), message.get("date")))
 
@@ -138,7 +145,17 @@ class Telegram:
         saved, reply = 0, "Only the paired account can do that."
         opening = OPEN.fullmatch(query.get("data") or "")
         undoing = UNDO.fullmatch(query.get("data") or "")
-        if opening and self.owner(chat_id, (query.get("from") or {}).get("id")):
+        answering = ANSWER.fullmatch(query.get("data") or "")
+        if answering and self.owner(chat_id, (query.get("from") or {}).get("id")):
+            asked = conn.execute("SELECT status FROM questions WHERE id = ? AND nonce = ?",
+                                 (int(answering.group(1)), answering.group(2))).fetchone()
+            reply = "That question is no longer open."
+            if asked and asked["status"] == "waiting":
+                choice = CHOICES.get(answering.group(3), answering.group(3))
+                saved = int(persist_inbound(conn, self.name, f"cb:{query['id']}", str(query["from"]["id"]),
+                                            f"answer {answering.group(1)} {choice}", now()))
+                reply = "Sending…"
+        elif opening and self.owner(chat_id, (query.get("from") or {}).get("id")):
             saved = int(persist_inbound(conn, self.name, f"cb:{query['id']}", str(query["from"]["id"]),
                                         f"open {opening.group(1)}", now()))
             reply = "Opening it on your Mac…"

@@ -9,7 +9,7 @@ from __future__ import annotations
 import contextlib
 from pathlib import Path
 
-from resetagent import apps, config, db, ideas, models, runs, settings, status, workspace
+from resetagent import apps, asking, config, db, ideas, models, runs, runtools, settings, status, workspace
 from resetagent.providers.common import describe
 from resetagent.timeutil import local, now, parse_iso, span
 
@@ -177,6 +177,23 @@ def open_run(conn, run: int) -> dict:
     return {"result": apps.open_run(conn, r) if r else f"No run #{run}."}
 
 
+def list_questions(conn) -> dict:
+    return {"waiting": asking.listing(conn),
+            "note": "answer_question passes on the user's answer to a question. Permission requests are the user's "
+                    "to allow or deny with the buttons."}
+
+
+def answer_question(conn, question: int, answer: str) -> dict:
+    return asking.answer_by_ai(conn, int(question), answer)
+
+
+def list_run_tools(conn) -> dict:
+    cfg = config.load()
+    return {"runTools": settings.show("run_tools", cfg["runs"]["tools"]), **runtools.inventory(cfg),
+            "note": "Change which ones runs can use with change_setting run_tools: \"all\", \"none\", or names "
+                    "from this list. One name covers both Codex and Claude Code."}
+
+
 def get_settings(conn) -> dict:
     return {"settings": settings.listing(config.load()),
             "note": "change_setting changes one. Reset tells the user about each change, with an Undo button."}
@@ -245,6 +262,16 @@ TOOLS = {
     "open_run": (open_run, "Open a run's chat in its desktop app (Codex or Claude) on the user's Mac, so they can "
                  "read it or continue it there. A Claude run can only move to Claude Desktop once it's done.",
                  _schema({"run": {"type": "integer"}}, ["run"])),
+    "list_questions": (list_questions, "Questions runs are waiting on the user to answer, and permission requests "
+                       "from sandboxed runs, with their options and when each closes.", _schema({})),
+    "answer_question": (answer_question, "Pass on the user's answer to a run's question, in their words or as an "
+                        "option's label, only from what they said in this conversation. Reset tells the user what "
+                        "you sent. You can't allow or deny permission requests: that's the user's to tap.",
+                        _schema({"question": {"type": "integer"}, "answer": {"type": "string"}},
+                                ["question", "answer"])),
+    "list_run_tools": (list_run_tools, "The user's connected tools (connectors like Gmail or Slack, plugins and "
+                       "MCP servers) on Codex and Claude Code, and which ones runs can use (the run_tools setting). "
+                       "Takes a few seconds.", _schema({})),
     "get_settings": (get_settings, "Reset's settings the user can tune by chatting: each one's current value, what it "
                      "does and what it accepts.", _schema({})),
     "change_setting": (change_setting, "Change one of Reset's settings (see get_settings), only because the user "

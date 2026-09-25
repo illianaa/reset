@@ -16,8 +16,9 @@ Claude and ChatGPT plans give you usage limits that reset every week, and someti
     - Codex runs are pinned in the Codex app.
     - You can watch Claude runs live in the Claude app, on your Mac or your phone. When one finishes, its chat stays open while you're in the Claude app. Once you leave the app, it moves into Claude Desktop's Code tab.
     - **Open in Codex** or **Open in Claude** takes you straight to a run's chat on your Mac.
+- **Answer runs from your phone:** when a run needs a choice only you can make, or needs you signed in to something, Reset texts you the question. Tap an answer, reply in your own words, or tell the AI. If you don't answer within 5 minutes, the run decides by itself, and its time limit pauses while it waits.
 - **Ask it anything:** "how many one-time resets do I have?", "what did run 3 get done?" Replies come from an AI brain running on your own Claude Code or Codex.
-- **Tune it by chatting:** "lower my floor to 3%", "allow 5 runs at once", "make runs sandboxed", "remind me 7 days and 1 day before a reset expires". Reset confirms every change in its own message, with an Undo button.
+- **Tune it by chatting:** "lower my floor to 3%", "allow 5 runs at once", "make runs sandboxed", "wait 15 minutes for my answers", "let runs use GitHub", "remind me 7 days and 1 day before a reset expires". Reset confirms every change in its own message, with an Undo button.
 
 Reset never sees your AI passwords or tokens. It works through the official `codex` and `claude` tools you're already signed in to.
 
@@ -62,16 +63,19 @@ There's nothing else to install.
 | `/runs` | What's running, and recent results |
 | `/stop` | Stops everything immediately and cancels pending requests (`stop 3` stops only run 3) |
 | `/floor 8` | Runs leave at least 8% of every usage limit untouched (`/floor` shows the current share) |
+| a reply to a run's question | Sends your answer to the run. Tapping a button works too, and so do `answer 12 2` and `allow 13` / `deny 13` |
 | anything else | Answered by the AI brain |
 
 The commands never depend on AI, so they keep working even when every usage limit is exhausted. If the Claude brain is out of usage, the Codex brain answers, and the other way round.
 
 ## Safety
 
-- **Nothing runs without your OK.** Every run needs your tap or code, and approvals can't come from an AI.
+- **Nothing runs without your OK.** Every run needs your tap or code, and approvals can't come from an AI. Reset's AI can pass your answer on to a run's question, and Reset tells you what it sent. Only you can allow what a sandboxed run asks to do.
 - **Bounded runs.** Each run has a token budget and a deadline, ends before any usage window resets, and refuses to start if paid overage could kick in.
 - **Your share stays yours.** Runs only start while you have at least 5% left of every limit. While runs are going, Reset rechecks every 5 minutes. If a subscription dips below that share, or paid usage turns on, Reset stops that subscription's runs. To keep a different share, ask your bot, or send `floor 10` with the percentage you want.
-- **Full access by default, so runs don't stall.** Runs can run commands and install packages without stopping to ask. If a run is still blocked, or asks a question nobody is there to answer, Reset texts you. Prefer tighter limits? `resetctl setup access --access sandboxed`.
+- **Full access by default, so runs don't stall.** Runs can run commands and install packages without stopping to ask. If a run is still blocked, Reset texts you. Prefer tighter limits? `resetctl setup access --access sandboxed`. Then, when a run wants to do more than change its own files, you get Allow and Deny buttons, and no answer counts as no.
+- **Your accounts stay out of runs unless you say so.** Runs don't get the tools you've connected to Codex or Claude Code (connectors like Gmail, Slack or GitHub, plugins, browser and computer control, MCP servers). They work with their built-in tools: the shell, files and the web. Ask your bot to "let runs use GitHub", or "let runs use all my tools". This only limits Reset's runs: when you continue a run's chat in the Codex or Claude app, your tools are back.
+- **Runs never ask for secrets.** They're told never to ask for passwords, tokens or keys. When one needs you signed in to something, it asks you to do that on your Mac.
 - **Your checkout stays untouched.** Runs on an existing codebase work on a new `reset/…` branch in a separate worktree, for you to review.
 - **Real cancellation.** Stopping kills every process the run started and verifies that nothing survived.
 - **Redemption stays with you.** Reset tells you how to redeem one-time resets; it doesn't redeem them itself.
